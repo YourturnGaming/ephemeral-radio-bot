@@ -1,0 +1,7 @@
+services:
+  ephemeral-bot:
+    build: .
+    container_name: ephemeral-bot
+    restart: unless-stopped
+    env_file:
+      - .env
