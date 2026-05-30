@@ -5,9 +5,10 @@ A Discord bot that streams [Ephemeral FM](https://ephemeral.club) into your voic
 ## Features
 
 - 🎵 Streams Ephemeral FM into any voice channel
-- 📻 Bot status updates in real-time when the track changes
+- 📻 Bot status updates in real-time when the track changes (via ICY stream metadata)
+- 🔔 Optional per-channel announcements when the track changes
 - 🔁 Auto-reconnects if the stream drops
-- `/play` `/stop` `/nowplaying` slash commands
+- `/play` `/stop` `/nowplaying` `/announce` slash commands
 
 ---
 
@@ -110,6 +111,7 @@ node bot.js
 | `/play` | Join your voice channel and start streaming |
 | `/stop` | Stop streaming and leave the voice channel |
 | `/nowplaying` | Show the currently playing track |
+| `/announce` | Toggle now-playing announcements in the current channel. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
 
 ---
 
