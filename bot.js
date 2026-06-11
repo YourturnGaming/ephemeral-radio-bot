@@ -18,6 +18,18 @@ const {
 const { spawn } = require('child_process');
 const https = require('https');
 require('dotenv').config();
+const log = require('./logger');
+
+// ── Crash handling ─────────────────────────────────────────────────────────
+
+process.on('uncaughtException', (err) => {
+  log.error(`Uncaught exception: ${err.stack ?? err.message}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log.error(`Unhandled rejection: ${reason?.stack ?? reason}`);
+});
 
 // Use system ffmpeg if available, fall back to ffmpeg-static
 let ffmpegBin = 'ffmpeg';
@@ -132,7 +144,7 @@ function watchIcyMetadata() {
               const title = parseIcyTitle(metaBuf.toString('utf8'));
               if (title && title !== currentTitle) {
                 currentTitle = title;
-                console.log(`Now playing: ${title}`);
+                log.info(`Now playing: ${title}`);
                 client.user?.setActivity(title, { type: ActivityType.Listening });
 
                 // Post to any guilds with announce enabled
@@ -203,15 +215,15 @@ const commands = [
 // ── Bot events ─────────────────────────────────────────────────────────────
 
 client.once('clientReady', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  console.log(`Ephemeral Bot is Ready!`);
+  log.info(`Logged in as ${client.user.tag}`);
+  log.info(`Ephemeral Bot is Ready!`);
 
   const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-    console.log('Slash commands registered.');
+    log.info('Slash commands registered.');
   } catch (err) {
-    console.error('Failed to register commands:', err);
+    log.error(`Failed to register commands: ${err.message}`);
   }
 
   watchIcyMetadata();
@@ -221,7 +233,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guildId, guild, member } = interaction;
-  console.log(`[${guild?.name ?? guildId}] @${interaction.user.tag} used /${commandName}`);
+  log.info(`[${guild?.name ?? guildId}] @${interaction.user.tag} used /${commandName}`);
 
   // ── /play ──────────────────────────────────────────────────────────────
   if (commandName === 'play') {
@@ -258,7 +270,7 @@ client.on('interactionCreate', async (interaction) => {
 
     player.on(AudioPlayerStatus.Idle, () => setTimeout(() => startStream(guildId), 2_000));
     player.on('error', (err) => {
-      console.error(`Player error in guild ${guildId}:`, err.message);
+      log.error(`Player error in guild ${guildId}: ${err.message}`);
       setTimeout(() => startStream(guildId), 5_000);
     });
 
@@ -277,14 +289,14 @@ client.on('interactionCreate', async (interaction) => {
 
         const MAX_REJOIN = 5;
         if (state.rejoinAttempts >= MAX_REJOIN) {
-          console.log(`[${guildId}] Max rejoin attempts reached, giving up.`);
+          log.warn(`[${guildId}] Max rejoin attempts reached, giving up.`);
           guildState.delete(guildId);
           return;
         }
 
         state.rejoinAttempts++;
-        const delay = state.rejoinAttempts * 5_000; // 5s, 10s, 15s, 20s, 25s
-        console.log(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts}/${MAX_REJOIN})`);
+        const delay = state.rejoinAttempts * 5_000;
+        log.warn(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts}/${MAX_REJOIN})`);
 
         setTimeout(async () => {
           const current = guildState.get(guildId);
@@ -301,11 +313,11 @@ client.on('interactionCreate', async (interaction) => {
             current.connection = newConnection;
             newConnection.subscribe(current.player);
             newConnection.on(VoiceConnectionStatus.Disconnected, () => newConnection.emit('disconnected'));
-            current.rejoinAttempts = 0; // Reset on success
+            current.rejoinAttempts = 0;
             startStream(guildId);
-            console.log(`[${guildId}] Successfully rejoined voice channel.`);
+            log.info(`[${guildId}] Successfully rejoined voice channel.`);
           } catch (err) {
-            console.error(`[${guildId}] Rejoin failed:`, err.message);
+            log.error(`[${guildId}] Rejoin failed: ${err.message}`);
             guildState.delete(guildId);
           }
         }, delay);
