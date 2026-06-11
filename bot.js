@@ -220,6 +220,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guildId, guild, member } = interaction;
+  console.log(`[${guild?.name ?? guildId}] @${interaction.user.tag} used /${commandName}`);
 
   // ── /play ──────────────────────────────────────────────────────────────
   if (commandName === 'play') {
