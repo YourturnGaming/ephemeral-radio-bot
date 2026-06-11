@@ -245,7 +245,14 @@ client.on('interactionCreate', async (interaction) => {
 
     const player = createAudioPlayer();
     connection.subscribe(player);
-    guildState.set(guildId, { connection, player, resource: null, announceChannelId: null });
+    guildState.set(guildId, {
+      connection,
+      player,
+      resource: null,
+      announceChannelId: null,
+      voiceChannelId: voiceChannel.id,
+      rejoinAttempts: 0,
+    });
 
     player.on(AudioPlayerStatus.Idle, () => setTimeout(() => startStream(guildId), 2_000));
     player.on('error', (err) => {
@@ -255,13 +262,51 @@ client.on('interactionCreate', async (interaction) => {
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       try {
+        // First try to recover a network blip
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
       } catch {
+        // Network recovery failed — bot was likely kicked. Try to rejoin.
         connection.destroy();
-        guildState.delete(guildId);
+        const state = guildState.get(guildId);
+        if (!state) return; // /stop was used, don't rejoin
+
+        const MAX_REJOIN = 5;
+        if (state.rejoinAttempts >= MAX_REJOIN) {
+          console.log(`[${guildId}] Max rejoin attempts reached, giving up.`);
+          guildState.delete(guildId);
+          return;
+        }
+
+        state.rejoinAttempts++;
+        const delay = state.rejoinAttempts * 5_000; // 5s, 10s, 15s, 20s, 25s
+        console.log(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts}/${MAX_REJOIN})`);
+
+        setTimeout(async () => {
+          const current = guildState.get(guildId);
+          if (!current) return; // /stop was used while waiting
+
+          try {
+            const guild = client.guilds.cache.get(guildId);
+            const newConnection = joinVoiceChannel({
+              channelId: current.voiceChannelId,
+              guildId,
+              adapterCreator: guild.voiceAdapterCreator,
+              selfDeaf: false,
+            });
+            current.connection = newConnection;
+            newConnection.subscribe(current.player);
+            newConnection.on(VoiceConnectionStatus.Disconnected, () => newConnection.emit('disconnected'));
+            current.rejoinAttempts = 0; // Reset on success
+            startStream(guildId);
+            console.log(`[${guildId}] Successfully rejoined voice channel.`);
+          } catch (err) {
+            console.error(`[${guildId}] Rejoin failed:`, err.message);
+            guildState.delete(guildId);
+          }
+        }, delay);
       }
     });
 
