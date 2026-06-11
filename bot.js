@@ -204,6 +204,7 @@ const commands = [
 
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  console.log(`[Ephemeral Bot] Ready!`);
 
   const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
   try {
