@@ -298,7 +298,7 @@ const commands = [
 
 // ── Bot events ─────────────────────────────────────────────────────────────
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   log.info(`Logged in as ${client.user.tag}`);
   log.info(`Ephemeral Bot is Ready!`);
 
