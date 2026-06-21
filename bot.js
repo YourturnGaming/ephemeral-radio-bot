@@ -212,15 +212,24 @@ function createStream() {
     'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'ignore'] });
 
-  return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+  return { resource, ffmpeg };
+}
+
+function killStream(state) {
+  if (state?.ffmpeg) {
+    state.ffmpeg.kill('SIGKILL');
+    state.ffmpeg = null;
+  }
 }
 
 function startStream(guildId) {
   const state = guildState.get(guildId);
   if (!state) return;
-  const resource = createStream();
+  killStream(state); // kill any existing ffmpeg before starting a new one
+  const { resource, ffmpeg } = createStream();
+  state.ffmpeg = ffmpeg;
   state.player.play(resource);
-  state.resource = resource;
 }
 
 // Attaches recovery logic to a voice connection. Re-usable so that a connection
@@ -244,6 +253,7 @@ function attachDisconnectHandler(connection, guildId, guild) {
       const MAX_REJOIN = 5;
       if (state.rejoinAttempts >= MAX_REJOIN) {
         log.warn(`[${guildId}] Max rejoin attempts reached, giving up.`);
+        killStream(state);
         guildState.delete(guildId);
         return;
       }
@@ -272,6 +282,7 @@ function attachDisconnectHandler(connection, guildId, guild) {
           log.info(`[${guildId}] Successfully rejoined voice channel.`);
         } catch (err) {
           log.error(`[${guildId}] Rejoin failed: ${err.message}`);
+          killStream(guildState.get(guildId));
           guildState.delete(guildId);
         }
       }, delay);
@@ -346,7 +357,7 @@ client.on('interactionCreate', async (interaction) => {
     guildState.set(guildId, {
       connection,
       player,
-      resource: null,
+      ffmpeg: null,
       announceChannelId: null,
       voiceChannelId: voiceChannel.id,
       rejoinAttempts: 0,
@@ -376,7 +387,9 @@ client.on('interactionCreate', async (interaction) => {
     if (!guildState.has(guildId)) {
       return interaction.reply({ content: 'Not currently streaming.', ephemeral: true });
     }
-    guildState.get(guildId).connection.destroy();
+    const stopping = guildState.get(guildId);
+    killStream(stopping);
+    stopping.connection.destroy();
     guildState.delete(guildId);
     await interaction.reply('Stopped streaming and left the voice channel.');
   }
