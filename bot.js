@@ -424,8 +424,12 @@ client.on('interactionCreate', async (interaction) => {
     const title = await fetchCurrentTitle() ?? currentTitle ?? 'Ephemeral FM';
     currentTitle = title;
 
+    const nowLine = isLive
+      ? `🎙️ LIVE: **${liveStreamer}**`
+      : `🎵 ${title}`;
+
     await interaction.editReply(
-      `Now streaming **Ephemeral FM** in **${voiceChannel.name}**\n🎵 ${title}`
+      `Now streaming **Ephemeral FM** in **${voiceChannel.name}**\n${nowLine}`
     );
   }
 
