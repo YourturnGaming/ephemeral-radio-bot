@@ -68,14 +68,64 @@ try {
   ffmpegBin = require('ffmpeg-static');
 }
 
-const STREAM_URL = 'https://listen.ephemeral.club/listen/ephemeral/radio.mp3';
+const STREAM_URL   = 'https://listen.ephemeral.club/listen/ephemeral/radio.mp3';
+const NOWPLAYING_API = 'https://listen.ephemeral.club/api/nowplaying/ephemeral';
+const LIVE_POLL_MS   = 30_000;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-// Per-guild state: { connection, player, resource, announceChannelId }
+// Per-guild state: { connection, player, ffmpeg, announceChannelId, voiceChannelId, rejoinAttempts }
 const guildState = new Map();
+
+// ── Live DJ detection ──────────────────────────────────────────────────────
+
+let isLive        = false;
+let liveStreamer   = '';
+
+function updateStatus() {
+  if (isLive) {
+    client.user?.setActivity(`🎙️ LIVE: ${liveStreamer}`, { type: ActivityType.Listening });
+  } else if (currentTitle) {
+    client.user?.setActivity(currentTitle, { type: ActivityType.Listening });
+  }
+}
+
+function announce(message) {
+  for (const [, state] of guildState) {
+    if (state.announceChannelId) {
+      const channel = client.channels.cache.get(state.announceChannelId);
+      channel?.send(message).catch(() => {});
+    }
+  }
+}
+
+async function pollLiveStatus() {
+  try {
+    const res = await fetch(NOWPLAYING_API);
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    const data = await res.json();
+    const { is_live, streamer_name } = data.live;
+
+    if (is_live && !isLive) {
+      isLive = true;
+      liveStreamer = streamer_name;
+      log.info(`Live DJ started: ${streamer_name}`);
+      updateStatus();
+      announce(`🎙️ **${streamer_name}** is now live on Ephemeral FM!`);
+    } else if (!is_live && isLive) {
+      isLive = false;
+      liveStreamer = '';
+      log.info('Live DJ ended, reverting to track metadata.');
+      updateStatus();
+      announce(`📻 Live set ended — back to regular programming.`);
+    }
+  } catch (err) {
+    log.warn(`Live poll failed: ${err.message}`);
+  }
+  setTimeout(pollLiveStatus, LIVE_POLL_MS);
+}
 
 // ── ICY metadata watcher ───────────────────────────────────────────────────
 
@@ -173,14 +223,9 @@ function watchIcyMetadata() {
               if (title && title !== currentTitle) {
                 currentTitle = title;
                 log.info(`Now playing: ${title}`);
-                client.user?.setActivity(title, { type: ActivityType.Listening });
-
-                // Post to any guilds with announce enabled
-                for (const [, state] of guildState) {
-                  if (state.announceChannelId) {
-                    const channel = client.channels.cache.get(state.announceChannelId);
-                    channel?.send(`🎵 Now playing: **${title}**`).catch(() => {});
-                  }
+                if (!isLive) {
+                  updateStatus();
+                  announce(`🎵 Now playing: **${title}**`);
                 }
               }
               readingMeta = false;
@@ -322,6 +367,7 @@ client.once('clientReady', async () => {
   }
 
   watchIcyMetadata();
+  pollLiveStatus();
 });
 
 client.on('interactionCreate', async (interaction) => {
