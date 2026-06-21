@@ -86,9 +86,9 @@ let liveStreamer   = '';
 
 function updateStatus() {
   if (isLive) {
-    client.user?.setActivity(`🎙️ LIVE: ${liveStreamer}`, { type: ActivityType.Streaming, url: 'https://ephemeral.club' });
+    client.user?.setActivity(`🎙️ LIVE: ${liveStreamer}`, { type: ActivityType.Listening });
   } else if (currentTitle) {
-    client.user?.setActivity(currentTitle, { type: ActivityType.Streaming, url: 'https://ephemeral.club' });
+    client.user?.setActivity(currentTitle, { type: ActivityType.Listening });
   }
 }
 
