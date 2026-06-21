@@ -86,9 +86,19 @@ let liveStreamer   = '';
 
 function updateStatus() {
   if (isLive) {
-    client.user?.setActivity(`🎙️ LIVE: ${liveStreamer}`, { type: ActivityType.Listening });
+    client.user?.setPresence({
+      activities: [
+        { name: 'Custom Status', type: ActivityType.Custom, state: `🎙️ LIVE: ${liveStreamer} — ephemeral.club` },
+        { name: `🎙️ LIVE: ${liveStreamer}`, type: ActivityType.Listening },
+      ],
+    });
   } else if (currentTitle) {
-    client.user?.setActivity(currentTitle, { type: ActivityType.Listening });
+    client.user?.setPresence({
+      activities: [
+        { name: 'Custom Status', type: ActivityType.Custom, state: `🎵 ${currentTitle} — ephemeral.club` },
+        { name: currentTitle, type: ActivityType.Listening },
+      ],
+    });
   }
 }
 
