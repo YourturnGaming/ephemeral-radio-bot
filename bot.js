@@ -435,7 +435,7 @@ client.on('interactionCreate', async (interaction) => {
     currentTitle = title;
 
     const nowLine = isLive
-      ? `🎙️ LIVE: **${liveStreamer}**`
+      ? `🎙️ LIVE: **${liveStreamer}**\n🎵 ${title}`
       : `🎵 ${title}`;
 
     await interaction.editReply(
