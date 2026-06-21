@@ -341,6 +341,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (guildState.has(guildId)) {
       const old = guildState.get(guildId);
+      killStream(old);
       old.connection.destroy();
       guildState.delete(guildId);
     }
