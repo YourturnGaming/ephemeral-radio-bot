@@ -5,6 +5,7 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -17,6 +18,8 @@ const {
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 const log = require('./logger');
 
@@ -59,7 +62,45 @@ process.on('unhandledRejection', (reason) => {
   log.error(`Unhandled rejection: ${reason?.stack ?? reason}`);
 });
 
-// Use system ffmpeg if available, fall back to ffmpeg-static
+// ── Guild config persistence ───────────────────────────────────────────────
+// Stores per-guild settings across restarts: announceChannelId, pingRoleId
+
+const DATA_DIR    = path.join(__dirname, 'data');
+const CONFIG_FILE = path.join(DATA_DIR, 'guilds.json');
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveConfig(config) {
+  try {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  } catch (err) {
+    log.error(`Failed to save guild config: ${err.message}`);
+  }
+}
+
+// guildConfig: { [guildId]: { announceChannelId, pingRoleId } }
+const guildConfig = loadConfig();
+
+function getGuildConfig(guildId) {
+  if (!guildConfig[guildId]) guildConfig[guildId] = { announceChannelId: null, pingRoleId: null };
+  return guildConfig[guildId];
+}
+
+function persistGuildConfig(guildId, patch) {
+  const cfg = getGuildConfig(guildId);
+  Object.assign(cfg, patch);
+  saveConfig(guildConfig);
+}
+
+// ── Use system ffmpeg if available, fall back to ffmpeg-static ─────────────
 let ffmpegBin = 'ffmpeg';
 try {
   const { execSync } = require('child_process');
@@ -68,7 +109,7 @@ try {
   ffmpegBin = require('ffmpeg-static');
 }
 
-const STREAM_URL   = 'https://listen.ephemeral.club/listen/ephemeral/radio.mp3';
+const STREAM_URL     = 'https://listen.ephemeral.club/listen/ephemeral/radio.mp3';
 const NOWPLAYING_API = 'https://listen.ephemeral.club/api/nowplaying/ephemeral';
 const LIVE_POLL_MS   = 30_000;
 
@@ -76,26 +117,28 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-// Per-guild state: { connection, player, ffmpeg, announceChannelId, voiceChannelId, rejoinAttempts }
+// Per-guild runtime state: { connection, player, ffmpeg, announceChannelId, voiceChannelId, rejoinAttempts }
 const guildState = new Map();
 
 // ── Live DJ detection ──────────────────────────────────────────────────────
 
 let isLive        = false;
 let liveStreamer   = '';
+let listenerCount = 0;
 
 function updateStatus() {
+  const listeners = listenerCount > 0 ? ` — 👥 ${listenerCount}` : '';
   if (isLive) {
     client.user?.setPresence({
       activities: [
-        { name: 'Custom Status', type: ActivityType.Custom, state: `🎙️ LIVE: ${liveStreamer} — ephemeral.club` },
+        { name: 'Custom Status', type: ActivityType.Custom, state: `🎙️ LIVE: ${liveStreamer}${listeners} — ephemeral.club` },
         { name: `🎙️ LIVE: ${liveStreamer}`, type: ActivityType.Listening },
       ],
     });
   } else if (currentTitle) {
     client.user?.setPresence({
       activities: [
-        { name: 'Custom Status', type: ActivityType.Custom, state: `🎵 ${currentTitle} — ephemeral.club` },
+        { name: 'Custom Status', type: ActivityType.Custom, state: `🎵 ${currentTitle}${listeners} — ephemeral.club` },
         { name: currentTitle, type: ActivityType.Listening },
       ],
     });
@@ -103,10 +146,12 @@ function updateStatus() {
 }
 
 function announce(message) {
-  for (const [, state] of guildState) {
+  for (const [guildId, state] of guildState) {
     if (state.announceChannelId) {
       const channel = client.channels.cache.get(state.announceChannelId);
-      channel?.send(message).catch(() => {});
+      const cfg = getGuildConfig(guildId);
+      const content = cfg.pingRoleId ? `<@&${cfg.pingRoleId}> ${message}` : message;
+      channel?.send(content).catch(() => {});
     }
   }
 }
@@ -118,10 +163,12 @@ async function pollLiveStatus() {
     const data = await res.json();
     const { is_live, streamer_name } = data.live;
 
+    listenerCount = data.listeners?.current ?? 0;
+
     if (is_live && !isLive) {
       isLive = true;
       liveStreamer = streamer_name;
-      log.info(`Live DJ started: ${streamer_name}`);
+      log.info(`Live DJ started: ${streamer_name} (${listenerCount} listeners)`);
       updateStatus();
       announce(`🎙️ **${streamer_name}** is now live on Ephemeral FM!`);
     } else if (!is_live && isLive) {
@@ -130,6 +177,9 @@ async function pollLiveStatus() {
       log.info('Live DJ ended, reverting to track metadata.');
       updateStatus();
       announce(`📻 Live set ended — back to regular programming.`);
+    } else {
+      // Listener count may have changed even if live state didn't — refresh status
+      updateStatus();
     }
   } catch (err) {
     log.warn(`Live poll failed: ${err.message}`);
@@ -360,6 +410,14 @@ const commands = [
   new SlashCommandBuilder()
     .setName('announce')
     .setDescription('Toggle now-playing announcements in this channel'),
+  new SlashCommandBuilder()
+    .setName('setrole')
+    .setDescription('Set (or clear) the role to ping on song/live announcements (Manage Server required)')
+    .addRoleOption((opt) =>
+      opt.setName('role')
+        .setDescription('Role to ping — leave blank to clear')
+        .setRequired(false)
+    ),
 ].map((c) => c.toJSON());
 
 // ── Bot events ─────────────────────────────────────────────────────────────
@@ -378,6 +436,46 @@ client.once('clientReady', async () => {
 
   watchIcyMetadata();
   pollLiveStatus();
+
+  // Auto-rejoin any voice channels the bot was in before restart
+  for (const [guildId, cfg] of Object.entries(guildConfig)) {
+    if (!cfg.voiceChannelId) continue;
+    try {
+      const guild = await client.guilds.fetch(guildId);
+      const channel = await guild.channels.fetch(cfg.voiceChannelId);
+      if (!channel?.isVoiceBased()) continue;
+
+      const connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId,
+        adapterCreator: guild.voiceAdapterCreator,
+        selfDeaf: false,
+      });
+
+      const player = createAudioPlayer();
+      connection.subscribe(player);
+      guildState.set(guildId, {
+        connection,
+        player,
+        ffmpeg: null,
+        announceChannelId: cfg.announceChannelId ?? null,
+        voiceChannelId: channel.id,
+        rejoinAttempts: 0,
+      });
+
+      player.on(AudioPlayerStatus.Idle, () => setTimeout(() => startStream(guildId), 2_000));
+      player.on('error', (err) => {
+        log.error(`Player error in guild ${guildId}: ${err.message}`);
+        setTimeout(() => startStream(guildId), 5_000);
+      });
+
+      attachDisconnectHandler(connection, guildId, guild);
+      startStream(guildId);
+      log.info(`[${guild.name}] Auto-rejoined #${channel.name} after restart.`);
+    } catch (err) {
+      log.warn(`[${guildId}] Auto-rejoin failed: ${err.message}`);
+    }
+  }
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -411,11 +509,12 @@ client.on('interactionCreate', async (interaction) => {
 
     const player = createAudioPlayer();
     connection.subscribe(player);
+    persistGuildConfig(guildId, { voiceChannelId: voiceChannel.id });
     guildState.set(guildId, {
       connection,
       player,
       ffmpeg: null,
-      announceChannelId: null,
+      announceChannelId: getGuildConfig(guildId).announceChannelId ?? null,
       voiceChannelId: voiceChannel.id,
       rejoinAttempts: 0,
     });
@@ -438,8 +537,9 @@ client.on('interactionCreate', async (interaction) => {
       ? `🎙️ LIVE: **${liveStreamer}**\n🎵 ${title}`
       : `🎵 ${title}`;
 
+    const listenersLine = listenerCount > 0 ? `\n👥 **${listenerCount}** listeners` : '';
     await interaction.editReply(
-      `Now streaming **Ephemeral FM** in **${voiceChannel.name}**\n${nowLine}`
+      `Now streaming **Ephemeral FM** in **${voiceChannel.name}**\n${nowLine}${listenersLine}`
     );
   }
 
@@ -452,12 +552,17 @@ client.on('interactionCreate', async (interaction) => {
     killStream(stopping);
     stopping.connection.destroy();
     guildState.delete(guildId);
+    persistGuildConfig(guildId, { voiceChannelId: null });
     await interaction.reply('Stopped streaming and left the voice channel.');
   }
 
   // ── /nowplaying ────────────────────────────────────────────────────────
   if (commandName === 'nowplaying') {
-    await interaction.reply(`🎵 ${currentTitle ?? 'Ephemeral FM'}`);
+    const trackLine = isLive
+      ? `🎙️ LIVE: **${liveStreamer}**\n🎵 ${currentTitle ?? 'Ephemeral FM'}`
+      : `🎵 ${currentTitle ?? 'Ephemeral FM'}`;
+    const listenersLine = listenerCount > 0 ? `\n👥 **${listenerCount}** listeners` : '';
+    await interaction.reply(`${trackLine}${listenersLine}`);
   }
 
   // ── /announce ──────────────────────────────────────────────────────────
@@ -468,13 +573,31 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (state.announceChannelId === interaction.channelId) {
-      // Already announcing in this channel — turn it off
       state.announceChannelId = null;
-      await interaction.reply('🔕 Now-playing announcements turned **off**.');
+      persistGuildConfig(guildId, { announceChannelId: null });
+      await interaction.reply({ content: '🔕 Now-playing announcements turned **off**.', ephemeral: true });
     } else {
-      // Turn on (or switch channel)
       state.announceChannelId = interaction.channelId;
-      await interaction.reply(`🔔 Now-playing announcements turned **on** in this channel.`);
+      persistGuildConfig(guildId, { announceChannelId: interaction.channelId });
+      await interaction.reply({ content: `🔔 Now-playing announcements turned **on** in this channel.`, ephemeral: true });
+    }
+  }
+
+  // ── /setrole ───────────────────────────────────────────────────────────
+  if (commandName === 'setrole') {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: 'You need the **Manage Server** permission to use this command.', ephemeral: true });
+    }
+
+    const role = interaction.options.getRole('role');
+    if (role) {
+      persistGuildConfig(guildId, { pingRoleId: role.id });
+      log.info(`[${guild?.name ?? guildId}] Ping role set to @${role.name} by ${interaction.user.tag}`);
+      await interaction.reply({ content: `🔔 Announcement pings set to ${role}. This role will be mentioned on song and live DJ changes.`, ephemeral: true });
+    } else {
+      persistGuildConfig(guildId, { pingRoleId: null });
+      log.info(`[${guild?.name ?? guildId}] Ping role cleared by ${interaction.user.tag}`);
+      await interaction.reply({ content: '🔕 Announcement pings cleared — no role will be pinged.', ephemeral: true });
     }
   }
 });

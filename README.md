@@ -6,9 +6,12 @@ A Discord bot that streams [Ephemeral FM](https://ephemeral.club) into your voic
 
 - 🎵 Streams Ephemeral FM into any voice channel
 - 📻 Bot status updates in real-time when the track changes (via ICY stream metadata)
-- 🔔 Optional per-channel announcements when the track changes
-- 🔁 Auto-reconnects if the stream drops
-- `/play` `/stop` `/nowplaying` `/announce` slash commands
+- 👥 Live listener count shown in bot status, `/play`, and `/nowplaying`
+- 🎙️ Live DJ detection — announces when a DJ goes live or ends their set
+- 🔔 Optional per-channel announcements when the track or live DJ changes
+- 🔁 Auto-reconnects if the stream drops or the bot is kicked
+- 💾 Remembers your settings (announce channel, ping role, voice channel) across restarts
+- `/play` `/stop` `/nowplaying` `/announce` `/setrole` slash commands
 
 ---
 
@@ -114,17 +117,31 @@ By default Pelican will show the server as **Starting** forever because the egg 
    ```
 4. Save the egg and restart your server — Pelican will now flip to **Running** as soon as the bot logs in
 
-
 ---
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `/play` | Join your voice channel and start streaming |
+| `/play` | Join your voice channel and start streaming. Shows current track and listener count. |
 | `/stop` | Stop streaming and leave the voice channel |
-| `/nowplaying` | Show the currently playing track |
-| `/announce` | Toggle now-playing announcements in the current channel. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
+| `/nowplaying` | Show the currently playing track and listener count |
+| `/announce` | Toggle song change and live DJ announcements in the current channel. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
+| `/setrole` | Set a role to ping on announcements (song changes, DJ going live/offline). Leave the role option blank to clear it. Requires **Manage Server** permission. |
+
+---
+
+## Persistent Settings
+
+The bot saves per-server settings to `data/guilds.json` and restores them automatically on restart:
+
+| Setting | Set by | Cleared by |
+|---|---|---|
+| Voice channel to stream in | `/play` | `/stop` |
+| Announcement channel | `/announce` | `/announce` (toggle off) |
+| Ping role | `/setrole @role` | `/setrole` (no role selected) |
+
+The bot will **automatically rejoin** its voice channel and resume streaming after a restart — no need to run `/play` again.
 
 ---
 
