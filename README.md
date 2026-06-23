@@ -126,7 +126,7 @@ By default Pelican will show the server as **Starting** forever because the egg 
 | `/play` | Join your voice channel and start streaming. Shows current track and listener count. |
 | `/stop` | Stop streaming and leave the voice channel |
 | `/nowplaying` | Show the currently playing track and listener count |
-| `/announce` | Toggle song change and live DJ announcements in the current channel. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
+| `/announce` | Toggle live DJ announcements in the current channel (goes live / set ends). Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
 | `/setrole` | Set a role to ping on announcements (song changes, DJ going live/offline). Leave the role option blank to clear it. Requires **Manage Server** permission. |
 
 ---

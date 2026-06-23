@@ -145,6 +145,7 @@ function updateStatus() {
   }
 }
 
+// Live DJ announcements — pings the configured role if set
 function announce(message) {
   for (const [guildId, state] of guildState) {
     if (state.announceChannelId) {
@@ -152,6 +153,16 @@ function announce(message) {
       const cfg = getGuildConfig(guildId);
       const content = cfg.pingRoleId ? `<@&${cfg.pingRoleId}> ${message}` : message;
       channel?.send(content).catch(() => {});
+    }
+  }
+}
+
+// Song change announcements — no role ping
+function announceSong(message) {
+  for (const [, state] of guildState) {
+    if (state.songChannelId) {
+      const channel = client.channels.cache.get(state.songChannelId);
+      channel?.send(message).catch(() => {});
     }
   }
 }
@@ -285,7 +296,7 @@ function watchIcyMetadata() {
                 log.info(`Now playing: ${title}`);
                 if (!isLive) {
                   updateStatus();
-                  announce(`🎵 Now playing: **${title}**`);
+                  announceSong(`🎵 Now playing: **${title}**`);
                 }
               }
               readingMeta = false;
@@ -409,7 +420,10 @@ const commands = [
     .setDescription('Show what is currently playing on Ephemeral FM'),
   new SlashCommandBuilder()
     .setName('announce')
-    .setDescription('Toggle now-playing announcements in this channel'),
+    .setDescription('Toggle live DJ announcements in this channel'),
+  new SlashCommandBuilder()
+    .setName('songs')
+    .setDescription('Toggle song change announcements in this channel'),
   new SlashCommandBuilder()
     .setName('setrole')
     .setDescription('Set (or clear) the role to ping on song/live announcements (Manage Server required)')
@@ -459,6 +473,7 @@ client.once('clientReady', async () => {
         player,
         ffmpeg: null,
         announceChannelId: cfg.announceChannelId ?? null,
+        songChannelId: cfg.songChannelId ?? null,
         voiceChannelId: channel.id,
         rejoinAttempts: 0,
       });
@@ -515,6 +530,7 @@ client.on('interactionCreate', async (interaction) => {
       player,
       ffmpeg: null,
       announceChannelId: getGuildConfig(guildId).announceChannelId ?? null,
+      songChannelId: getGuildConfig(guildId).songChannelId ?? null,
       voiceChannelId: voiceChannel.id,
       rejoinAttempts: 0,
     });
@@ -575,11 +591,29 @@ client.on('interactionCreate', async (interaction) => {
     if (state.announceChannelId === interaction.channelId) {
       state.announceChannelId = null;
       persistGuildConfig(guildId, { announceChannelId: null });
-      await interaction.reply({ content: '🔕 Now-playing announcements turned **off**.', ephemeral: true });
+      await interaction.reply({ content: '🔕 Live DJ announcements turned **off**.', ephemeral: true });
     } else {
       state.announceChannelId = interaction.channelId;
       persistGuildConfig(guildId, { announceChannelId: interaction.channelId });
-      await interaction.reply({ content: `🔔 Now-playing announcements turned **on** in this channel.`, ephemeral: true });
+      await interaction.reply({ content: `🔔 Live DJ announcements turned **on** in this channel.`, ephemeral: true });
+    }
+  }
+
+  // ── /songs ────────────────────────────────────────────────────────────
+  if (commandName === 'songs') {
+    const state = guildState.get(guildId);
+    if (!state) {
+      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', ephemeral: true });
+    }
+
+    if (state.songChannelId === interaction.channelId) {
+      state.songChannelId = null;
+      persistGuildConfig(guildId, { songChannelId: null });
+      await interaction.reply({ content: '🔕 Song announcements turned **off**.', ephemeral: true });
+    } else {
+      state.songChannelId = interaction.channelId;
+      persistGuildConfig(guildId, { songChannelId: interaction.channelId });
+      await interaction.reply({ content: '🎵 Song announcements turned **on** in this channel.', ephemeral: true });
     }
   }
 
