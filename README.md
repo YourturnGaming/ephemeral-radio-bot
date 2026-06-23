@@ -127,6 +127,7 @@ By default Pelican will show the server as **Starting** forever because the egg 
 | `/stop` | Stop streaming and leave the voice channel |
 | `/nowplaying` | Show the currently playing track and listener count |
 | `/announce` | Toggle live DJ announcements in the current channel (goes live / set ends). Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
+| `/songs` | Toggle song change announcements in the current channel. No role ping. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
 | `/setrole` | Set a role to ping on announcements (song changes, DJ going live/offline). Leave the role option blank to clear it. Requires **Manage Server** permission. |
 
 ---
@@ -138,8 +139,9 @@ The bot saves per-server settings to `data/guilds.json` and restores them automa
 | Setting | Set by | Cleared by |
 |---|---|---|
 | Voice channel to stream in | `/play` | `/stop` |
-| Announcement channel | `/announce` | `/announce` (toggle off) |
-| Ping role | `/setrole @role` | `/setrole` (no role selected) |
+| Live DJ announcement channel | `/announce` | `/announce` (toggle off) |
+| Song announcement channel | `/songs` | `/songs` (toggle off) |
+| Ping role (live DJ only) | `/setrole @role` | `/setrole` (no role selected) |
 
 The bot will **automatically rejoin** its voice channel and resume streaming after a restart — no need to run `/play` again.
 
