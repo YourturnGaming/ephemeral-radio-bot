@@ -348,60 +348,87 @@ function startStream(guildId) {
   state.player.play(resource);
 }
 
+// Schedules a rejoin attempt for a guild whose voice connection has been lost.
+// Shared by both the error handler and the Disconnected handler so both paths
+// use the same backoff/retry logic.
+function scheduleRejoin(guildId, guild) {
+  const state = guildState.get(guildId);
+  if (!state) return; // /stop was used, don't rejoin
+
+  const MAX_REJOIN = 5;
+  if (state.rejoinAttempts >= MAX_REJOIN) {
+    log.warn(`[${guildId}] Max rejoin attempts reached, giving up.`);
+    killStream(state);
+    guildState.delete(guildId);
+    return;
+  }
+
+  state.rejoinAttempts++;
+  const delay = state.rejoinAttempts * 5_000;
+  log.warn(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts}/${MAX_REJOIN})`);
+
+  setTimeout(() => {
+    const current = guildState.get(guildId);
+    if (!current) return; // /stop was used while waiting
+
+    try {
+      const g = guild ?? client.guilds.cache.get(guildId);
+      const newConnection = joinVoiceChannel({
+        channelId: current.voiceChannelId,
+        guildId,
+        adapterCreator: g.voiceAdapterCreator,
+        selfDeaf: false,
+      });
+      current.connection = newConnection;
+      newConnection.subscribe(current.player);
+      attachDisconnectHandler(newConnection, guildId, g);
+      current.rejoinAttempts = 0;
+      startStream(guildId);
+      log.info(`[${guildId}] Successfully rejoined voice channel.`);
+    } catch (err) {
+      log.error(`[${guildId}] Rejoin failed: ${err.message}`);
+      killStream(guildState.get(guildId));
+      guildState.delete(guildId);
+    }
+  }, delay);
+}
+
 // Attaches recovery logic to a voice connection. Re-usable so that a connection
 // created during a rejoin gets the SAME handler (the old code emitted a dead
 // 'disconnected' event here, so a second disconnect was never handled).
 function attachDisconnectHandler(connection, guildId, guild) {
+  // Catch errors emitted directly on the connection (e.g. EAI_AGAIN on the UDP
+  // socket during a voice-server migration). Without this listener, the error
+  // becomes an uncaughtException that the global handler silently swallows —
+  // the voice library's state machine never transitions to Disconnected, so the
+  // handler below never fires and the bot is left with a silently broken
+  // connection that streams to nobody.
+  connection.on('error', (err) => {
+    log.warn(`[${guildId}] Voice connection error: ${err.message}`);
+    if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      connection.destroy();
+    }
+    scheduleRejoin(guildId, guild);
+  });
+
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    // Pre-silence both entersState promises so that whichever one Promise.race
+    // doesn't consume doesn't produce an unhandled rejection later.
+    const p1 = entersState(connection, VoiceConnectionStatus.Signalling, 5_000);
+    const p2 = entersState(connection, VoiceConnectionStatus.Connecting, 5_000);
+    p1.catch(() => {});
+    p2.catch(() => {});
     try {
       // First try to recover a brief network blip
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
+      await Promise.race([p1, p2]);
       // Recovered on its own — nothing more to do.
     } catch {
+      // If already destroyed (e.g. by the error handler above), skip to avoid
+      // a double rejoin.
+      if (connection.state.status === VoiceConnectionStatus.Destroyed) return;
       // Recovery failed — bot was likely kicked/moved. Try to rejoin.
       connection.destroy();
-      const state = guildState.get(guildId);
-      if (!state) return; // /stop was used, don't rejoin
-
-      const MAX_REJOIN = 5;
-      if (state.rejoinAttempts >= MAX_REJOIN) {
-        log.warn(`[${guildId}] Max rejoin attempts reached, giving up.`);
-        killStream(state);
-        guildState.delete(guildId);
-        return;
-      }
-
-      state.rejoinAttempts++;
-      const delay = state.rejoinAttempts * 5_000;
-      log.warn(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts}/${MAX_REJOIN})`);
-
-      setTimeout(() => {
-        const current = guildState.get(guildId);
-        if (!current) return; // /stop was used while waiting
-
-        try {
-          const g = guild ?? client.guilds.cache.get(guildId);
-          const newConnection = joinVoiceChannel({
-            channelId: current.voiceChannelId,
-            guildId,
-            adapterCreator: g.voiceAdapterCreator,
-            selfDeaf: false,
-          });
-          current.connection = newConnection;
-          newConnection.subscribe(current.player);
-          attachDisconnectHandler(newConnection, guildId, g); // re-attach, don't emit a dead event
-          current.rejoinAttempts = 0;
-          startStream(guildId);
-          log.info(`[${guildId}] Successfully rejoined voice channel.`);
-        } catch (err) {
-          log.error(`[${guildId}] Rejoin failed: ${err.message}`);
-          killStream(guildState.get(guildId));
-          guildState.delete(guildId);
-        }
-      }, delay);
+      scheduleRejoin(guildId, guild);
     }
   });
 }
