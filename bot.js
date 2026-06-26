@@ -320,6 +320,7 @@ function createStream() {
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
+    '-timeout', '10000000', // 10s connection timeout — fail fast so idle handler can retry
     '-i', STREAM_URL,
     '-vn',
     '-ar', '48000',
@@ -355,19 +356,12 @@ function scheduleRejoin(guildId, guild) {
   const state = guildState.get(guildId);
   if (!state) return; // /stop was used, don't rejoin
 
-  const MAX_REJOIN = 5;
-  if (state.rejoinAttempts >= MAX_REJOIN) {
-    log.warn(`[${guildId}] Max rejoin attempts reached, giving up.`);
-    killStream(state);
-    guildState.delete(guildId);
-    return;
-  }
-
   state.rejoinAttempts++;
-  const delay = state.rejoinAttempts * 5_000;
-  log.warn(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts}/${MAX_REJOIN})`);
+  const DELAYS = [5, 15, 30, 45, 60];
+  const delay = (DELAYS[state.rejoinAttempts - 1] ?? 60) * 1_000;
+  log.warn(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts})`);
 
-  setTimeout(() => {
+  setTimeout(async () => {
     const current = guildState.get(guildId);
     if (!current) return; // /stop was used while waiting
 
@@ -382,13 +376,36 @@ function scheduleRejoin(guildId, guild) {
       current.connection = newConnection;
       newConnection.subscribe(current.player);
       attachDisconnectHandler(newConnection, guildId, g);
+
+      // Wait for the connection to actually be ready before starting the stream.
+      // joinVoiceChannel() is synchronous — without this the success log fires
+      // immediately even when the network is still down.
+      await entersState(newConnection, VoiceConnectionStatus.Ready, 15_000);
+
       current.rejoinAttempts = 0;
       startStream(guildId);
       log.info(`[${guildId}] Successfully rejoined voice channel.`);
+
+      // Watchdog: if the player still isn't Playing after 15s the stream likely
+      // got stuck buffering (ffmpeg connected but network was still flaky).
+      const watchdog = setTimeout(() => {
+        const s = guildState.get(guildId);
+        if (!s) return;
+        if (s.player.state.status !== AudioPlayerStatus.Playing) {
+          log.warn(`[${guildId}] Stream not playing 15s after rejoin, force-restarting.`);
+          startStream(guildId);
+        }
+      }, 15_000);
+      current.player.once(AudioPlayerStatus.Playing, () => clearTimeout(watchdog));
     } catch (err) {
-      log.error(`[${guildId}] Rejoin failed: ${err.message}`);
-      killStream(guildState.get(guildId));
-      guildState.delete(guildId);
+      log.warn(`[${guildId}] Rejoin failed: ${err.message} — will retry.`);
+      // Destroy the partial connection if it wasn't already, then let
+      // scheduleRejoin try the next attempt (state is preserved so the
+      // attempt counter and backoff keep incrementing correctly).
+      if (current.connection?.state?.status !== VoiceConnectionStatus.Destroyed) {
+        current.connection?.destroy();
+      }
+      scheduleRejoin(guildId, guild);
     }
   }, delay);
 }
@@ -512,6 +529,7 @@ client.once('clientReady', async () => {
       });
 
       attachDisconnectHandler(connection, guildId, guild);
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
       startStream(guildId);
       log.info(`[${guild.name}] Auto-rejoined #${channel.name} after restart.`);
     } catch (err) {
