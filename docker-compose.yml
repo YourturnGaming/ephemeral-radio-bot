@@ -5,3 +5,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      # Persist per-guild settings (announce/song channels, ping role, voice
+      # channel) across container rebuilds and recreations.
+      - ./data:/app/data

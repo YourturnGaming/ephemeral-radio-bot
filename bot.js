@@ -45,14 +45,12 @@ function isRecoverableNetError(err) {
     /EAI_AGAIN|ENOTFOUND|ECONNRESET|getaddrinfo/i.test(err?.message ?? '');
 }
 
-// Kill all active ffmpeg child processes. Called on shutdown and before any
-// process.exit() so Pelican/Docker don't end up with orphaned ffmpeg processes.
+// Kill the single shared ffmpeg child process. Called on shutdown and before any
+// process.exit() so Pelican/Docker don't end up with an orphaned ffmpeg process.
 function cleanupAllStreams() {
-  for (const [, state] of guildState) {
-    if (state?.ffmpeg) {
-      try { state.ffmpeg.kill('SIGKILL'); } catch {}
-      state.ffmpeg = null;
-    }
+  if (globalFfmpeg) {
+    try { globalFfmpeg.kill('SIGKILL'); } catch {}
+    globalFfmpeg = null;
   }
 }
 
@@ -132,8 +130,16 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-// Per-guild runtime state: { connection, player, ffmpeg, announceChannelId, voiceChannelId, rejoinAttempts }
+// Per-guild runtime state: { connection, announceChannelId, songChannelId, voiceChannelId, rejoinAttempts }
+// NOTE: there is no per-guild player/ffmpeg — all guilds share ONE global stream
+// (see the Audio stream section) so the bot only opens a single connection to the
+// radio source regardless of how many servers it streams to.
 const guildState = new Map();
+
+// The single shared audio pipeline. One ffmpeg → one AudioPlayer → fanned out to
+// every guild's voice connection by @discordjs/voice itself.
+let globalFfmpeg = null;
+let globalPlayer = null;
 
 // ── Live DJ detection ──────────────────────────────────────────────────────
 
@@ -348,21 +354,66 @@ function createStream() {
   return { resource, ffmpeg };
 }
 
-function killStream(state) {
-  if (state?.ffmpeg) {
-    state.ffmpeg.kill('SIGKILL');
-    state.ffmpeg = null;
+// Kills the single shared ffmpeg process (if running).
+function killStream() {
+  if (globalFfmpeg) {
+    globalFfmpeg.kill('SIGKILL');
+    globalFfmpeg = null;
   }
 }
 
-function startStream(guildId) {
-  const state = guildState.get(guildId);
-  if (!state) return;
-  killStream(state); // kill any existing ffmpeg before starting a new one
+// (Re)starts the shared stream: kills any existing ffmpeg, spawns a fresh one,
+// and plays it on the global player. All subscribed guild connections receive it.
+function startStream() {
+  killStream();
   const { resource, ffmpeg } = createStream();
-  state.ffmpeg = ffmpeg;
-  state.player.play(resource);
+  globalFfmpeg = ffmpeg;
+  globalPlayer.play(resource);
 }
+
+// True if a real (non-bot) member is present in the given guild's voice channel.
+function guildHasListeners(guildId) {
+  const state = guildState.get(guildId);
+  if (!state) return false;
+  const channel = client.guilds.cache.get(guildId)?.channels?.cache?.get(state.voiceChannelId);
+  return channel?.members?.some((m) => !m.user.bot) ?? false;
+}
+
+// True if at least one guild has a real listener in the bot's voice channel.
+function anyListeners() {
+  for (const [guildId] of guildState) {
+    if (guildHasListeners(guildId)) return true;
+  }
+  return false;
+}
+
+// Runs the shared stream only while at least one real listener is present in any
+// guild's voice channel; otherwise stops it so the bot drops its radio connection
+// while sitting idle in a channel 24/7. Idempotent — safe to call on every
+// join/leave/rejoin/voiceStateUpdate.
+function ensureStream() {
+  if (!anyListeners()) {
+    killStream();
+    return;
+  }
+  // Start only if the player is idle (no active resource). If it's already
+  // Playing/Buffering, a newly subscribed connection just joins the existing feed.
+  if (globalPlayer.state.status === AudioPlayerStatus.Idle) {
+    startStream();
+  }
+}
+
+// Create the one shared player up front and wire its lifecycle once.
+globalPlayer = createAudioPlayer();
+globalPlayer.on(AudioPlayerStatus.Idle, () => {
+  // Resource ended/errored. Restart shortly if anyone is still listening.
+  if (guildState.size > 0) setTimeout(ensureStream, 2_000);
+});
+globalPlayer.on('error', (err) => {
+  log.error(`Shared player error: ${err.message}`);
+  // The player transitions to Idle after an error, so the Idle handler above
+  // performs the actual restart — just log here.
+});
 
 // Schedules a rejoin attempt for a guild whose voice connection has been lost.
 // Shared by both the error handler and the Disconnected handler so both paths
@@ -389,31 +440,19 @@ function scheduleRejoin(guildId, guild) {
         selfDeaf: false,
       });
       current.connection = newConnection;
-      newConnection.subscribe(current.player);
+      newConnection.subscribe(globalPlayer);
       attachDisconnectHandler(newConnection, guildId, g);
 
-      // Wait for the connection to actually be ready before starting the stream.
+      // Wait for the connection to actually be ready before declaring success.
       // joinVoiceChannel() is synchronous — without this the success log fires
       // immediately even when the network is still down.
       await entersState(newConnection, VoiceConnectionStatus.Ready, 15_000);
 
       current.rejoinAttempts = 0;
-      startStream(guildId);
+      // The shared stream is likely already playing (other guilds keep it alive);
+      // ensureStream only (re)starts it if it had stopped while this was the last guild.
+      ensureStream();
       log.info(`[${guildId}] Successfully rejoined voice channel.`);
-
-      // Watchdog: if the stream is still not Playing after 15s, kill the stuck
-      // ffmpeg so the player goes Idle and the idle handler restarts it cleanly.
-      // Killing here (not calling startStream directly) keeps a single restart
-      // path and avoids racing with the idle handler.
-      const watchdog = setTimeout(() => {
-        const s = guildState.get(guildId);
-        if (!s) return;
-        if (s.player.state.status !== AudioPlayerStatus.Playing) {
-          log.warn(`[${guildId}] Stream not playing 15s after rejoin, killing for idle-handler restart.`);
-          killStream(s);
-        }
-      }, 15_000);
-      current.player.once(AudioPlayerStatus.Playing, () => clearTimeout(watchdog));
     } catch (err) {
       log.warn(`[${guildId}] Rejoin failed: ${err.message} — will retry.`);
       // Destroy the partial connection if it wasn't already, then let
@@ -442,7 +481,8 @@ function attachDisconnectHandler(connection, guildId, guild) {
     if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
       connection.destroy();
     }
-    killStream(guildState.get(guildId));
+    // Don't touch the shared stream — other guilds may still be listening. The
+    // guild stays in guildState so scheduleRejoin can reconnect it.
     scheduleRejoin(guildId, guild);
   });
 
@@ -463,7 +503,7 @@ function attachDisconnectHandler(connection, guildId, guild) {
       if (connection.state.status === VoiceConnectionStatus.Destroyed) return;
       // Recovery failed — bot was likely kicked/moved. Try to rejoin.
       connection.destroy();
-      killStream(guildState.get(guildId));
+      // Don't touch the shared stream — other guilds may still be listening.
       scheduleRejoin(guildId, guild);
     }
   });
@@ -529,27 +569,18 @@ client.once('clientReady', async () => {
         selfDeaf: false,
       });
 
-      const player = createAudioPlayer();
-      connection.subscribe(player);
+      connection.subscribe(globalPlayer);
       guildState.set(guildId, {
         connection,
-        player,
-        ffmpeg: null,
         announceChannelId: cfg.announceChannelId ?? null,
         songChannelId: cfg.songChannelId ?? null,
         voiceChannelId: channel.id,
         rejoinAttempts: 0,
       });
 
-      player.on(AudioPlayerStatus.Idle, () => setTimeout(() => startStream(guildId), 2_000));
-      player.on('error', (err) => {
-        log.error(`Player error in guild ${guildId}: ${err.message}`);
-        setTimeout(() => startStream(guildId), 5_000);
-      });
-
       attachDisconnectHandler(connection, guildId, guild);
       await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-      startStream(guildId);
+      ensureStream();
       log.info(`[${guild.name}] Auto-rejoined #${channel.name} after restart.`);
     } catch (err) {
       log.warn(`[${guildId}] Auto-rejoin failed: ${err.message}`);
@@ -573,9 +604,9 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferReply();
 
     if (guildState.has(guildId)) {
-      const old = guildState.get(guildId);
-      killStream(old);
-      old.connection.destroy();
+      // Re-invoking /play in a guild that's already set up — drop the old
+      // connection but leave the shared stream alone (other guilds need it).
+      guildState.get(guildId).connection.destroy();
       guildState.delete(guildId);
     }
 
@@ -586,28 +617,19 @@ client.on('interactionCreate', async (interaction) => {
       selfDeaf: false,
     });
 
-    const player = createAudioPlayer();
-    connection.subscribe(player);
+    connection.subscribe(globalPlayer);
     persistGuildConfig(guildId, { voiceChannelId: voiceChannel.id });
     guildState.set(guildId, {
       connection,
-      player,
-      ffmpeg: null,
       announceChannelId: getGuildConfig(guildId).announceChannelId ?? null,
       songChannelId: getGuildConfig(guildId).songChannelId ?? null,
       voiceChannelId: voiceChannel.id,
       rejoinAttempts: 0,
     });
 
-    player.on(AudioPlayerStatus.Idle, () => setTimeout(() => startStream(guildId), 2_000));
-    player.on('error', (err) => {
-      log.error(`Player error in guild ${guildId}: ${err.message}`);
-      setTimeout(() => startStream(guildId), 5_000);
-    });
-
     attachDisconnectHandler(connection, guildId, guild);
 
-    startStream(guildId);
+    ensureStream();
 
     // Always fetch fresh title at play time so it's never stale
     const title = await fetchCurrentTitle() ?? currentTitle ?? 'Ephemeral FM';
@@ -629,10 +651,12 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: 'Not currently streaming.', ephemeral: true });
     }
     const stopping = guildState.get(guildId);
-    killStream(stopping);
     stopping.connection.destroy();
     guildState.delete(guildId);
     persistGuildConfig(guildId, { voiceChannelId: null });
+    // If that was the last guild listening, stop the shared stream entirely so
+    // the bot stops being a listener on the radio source.
+    ensureStream();
     await interaction.reply('Stopped streaming and left the voice channel.');
   }
 
@@ -698,6 +722,21 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: '🔕 Announcement pings cleared — no role will be pinged.', ephemeral: true });
     }
   }
+});
+
+// Start/stop the shared stream based on whether real users are in the bot's
+// voice channel. The bot stays connected 24/7 but only consumes the radio
+// stream while someone is actually listening.
+client.on('voiceStateUpdate', (oldState, newState) => {
+  const guildId = (newState.guild ?? oldState.guild)?.id;
+  if (!guildId || !guildState.has(guildId)) return;
+  if (newState.member?.user?.bot) return; // ignore bot (incl. our own) voice changes
+
+  const botChannelId = guildState.get(guildId).voiceChannelId;
+  // Only react when the change involves the bot's channel (someone joined or left it).
+  if (oldState.channelId !== botChannelId && newState.channelId !== botChannelId) return;
+
+  ensureStream();
 });
 
 client.login(process.env.BOT_TOKEN);

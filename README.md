@@ -8,10 +8,12 @@ A Discord bot that streams [Ephemeral FM](https://ephemeral.club) into your voic
 - 📻 Bot status updates in real-time when the track changes (via ICY stream metadata)
 - 👥 Live listener count shown in bot status, `/play`, and `/nowplaying`
 - 🎙️ Live DJ detection — announces when a DJ goes live or ends their set
-- 🔔 Optional per-channel announcements when the track or live DJ changes
+- 🔔 Optional per-channel announcements for song changes and live DJ events
 - 🔁 Auto-reconnects if the stream drops or the bot is kicked
 - 💾 Remembers your settings (announce channel, ping role, voice channel) across restarts
-- `/play` `/stop` `/nowplaying` `/announce` `/setrole` slash commands
+- 🪶 Single shared stream — one connection to the radio source no matter how many servers it streams to
+- 💤 Only streams when someone's listening — stays parked in the channel 24/7 but goes silent (and drops the radio connection) when the channel is empty
+- `/play` `/stop` `/nowplaying` `/announce` `/songs` `/setrole` slash commands
 
 ---
 
@@ -62,6 +64,8 @@ Stop the bot:
 ```bash
 docker compose down
 ```
+
+> Per-guild settings are stored in `./data/guilds.json`, which is mounted as a volume so they survive container rebuilds and recreations.
 
 ---
 
@@ -143,7 +147,14 @@ The bot saves per-server settings to `data/guilds.json` and restores them automa
 | Song announcement channel | `/songs` | `/songs` (toggle off) |
 | Ping role (live DJ only) | `/setrole @role` | `/setrole` (no role selected) |
 
-The bot will **automatically rejoin** its voice channel and resume streaming after a restart — no need to run `/play` again.
+The bot will **automatically rejoin** its voice channel after a restart — no need to run `/play` again.
+
+---
+
+## How streaming works
+
+- **One shared stream.** No matter how many servers the bot streams to, it opens a single connection to the radio source and fans that one audio feed out to every voice channel. So on the website's listener count the bot only ever shows as **1** listener while playing (plus 1 for the always-on title watcher), not one per server.
+- **Listener-aware.** The bot stays parked in its voice channel 24/7, but it only runs the stream while a real (non-bot) user is in the channel with it. When everyone leaves, it goes silent and drops the radio connection; when someone joins, it starts back up automatically.
 
 ---
 
