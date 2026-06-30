@@ -45,12 +45,27 @@ function isRecoverableNetError(err) {
     /EAI_AGAIN|ENOTFOUND|ECONNRESET|getaddrinfo/i.test(err?.message ?? '');
 }
 
+// Kill all active ffmpeg child processes. Called on shutdown and before any
+// process.exit() so Pelican/Docker don't end up with orphaned ffmpeg processes.
+function cleanupAllStreams() {
+  for (const [, state] of guildState) {
+    if (state?.ffmpeg) {
+      try { state.ffmpeg.kill('SIGKILL'); } catch {}
+      state.ffmpeg = null;
+    }
+  }
+}
+
+process.on('SIGTERM', () => { cleanupAllStreams(); process.exit(0); });
+process.on('SIGINT',  () => { cleanupAllStreams(); process.exit(0); });
+
 process.on('uncaughtException', (err) => {
   if (isRecoverableNetError(err)) {
     log.warn(`Recoverable network error (ignored): ${err.message}`);
     return; // keep running; reconnect logic handles it
   }
   log.error(`Uncaught exception: ${err.stack ?? err.message}`);
+  cleanupAllStreams();
   process.exit(1);
 });
 
@@ -386,14 +401,16 @@ function scheduleRejoin(guildId, guild) {
       startStream(guildId);
       log.info(`[${guildId}] Successfully rejoined voice channel.`);
 
-      // Watchdog: if the player still isn't Playing after 15s the stream likely
-      // got stuck buffering (ffmpeg connected but network was still flaky).
+      // Watchdog: if the stream is still not Playing after 15s, kill the stuck
+      // ffmpeg so the player goes Idle and the idle handler restarts it cleanly.
+      // Killing here (not calling startStream directly) keeps a single restart
+      // path and avoids racing with the idle handler.
       const watchdog = setTimeout(() => {
         const s = guildState.get(guildId);
         if (!s) return;
         if (s.player.state.status !== AudioPlayerStatus.Playing) {
-          log.warn(`[${guildId}] Stream not playing 15s after rejoin, force-restarting.`);
-          startStream(guildId);
+          log.warn(`[${guildId}] Stream not playing 15s after rejoin, killing for idle-handler restart.`);
+          killStream(s);
         }
       }, 15_000);
       current.player.once(AudioPlayerStatus.Playing, () => clearTimeout(watchdog));
@@ -425,6 +442,7 @@ function attachDisconnectHandler(connection, guildId, guild) {
     if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
       connection.destroy();
     }
+    killStream(guildState.get(guildId));
     scheduleRejoin(guildId, guild);
   });
 
@@ -445,6 +463,7 @@ function attachDisconnectHandler(connection, guildId, guild) {
       if (connection.state.status === VoiceConnectionStatus.Destroyed) return;
       // Recovery failed — bot was likely kicked/moved. Try to rejoin.
       connection.destroy();
+      killStream(guildState.get(guildId));
       scheduleRejoin(guildId, guild);
     }
   });
