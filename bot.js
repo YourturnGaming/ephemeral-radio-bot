@@ -124,7 +124,20 @@ try {
 
 const STREAM_URL     = 'https://listen.ephemeral.club/listen/ephemeral/radio.mp3';
 const NOWPLAYING_API = 'https://listen.ephemeral.club/api/nowplaying/ephemeral';
-const LIVE_POLL_MS   = 30_000;
+const LIVE_POLL_MS      = 30_000; // normal API poll interval
+const LIVE_POLL_FAST_MS = 5_000;  // poll faster while the source is unreachable (to detect recovery)
+
+// Stream restart backoff. When the source is down, spawning a fresh ffmpeg every
+// couple of seconds hammers the server with connections that Icecast is slow to
+// reap — inflating the listener count. Exponential backoff + an outage gate keeps
+// reconnection attempts sparse until connectivity actually returns.
+const RESTART_BASE_MS = 3_000;
+const RESTART_MAX_MS  = 60_000;
+
+// Shared outage flag — the single source of truth for "is the radio reachable".
+// Driven by the API poll (same host, but the API doesn't count as a listener), so
+// no component ever opens a stream connection just to test connectivity.
+let streamReachable = true;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -197,6 +210,15 @@ async function pollLiveStatus() {
 
     listenerCount = data.listeners?.current ?? 0;
 
+    // Source is reachable. If it just came back, rebuild voice connections (which
+    // may be stale zombies after the outage) and restart the stream.
+    if (!streamReachable) {
+      streamReachable = true;
+      log.info('Radio source reachable again.');
+      rejoinAllGuilds();
+      ensureStream();
+    }
+
     if (is_live && !isLive) {
       isLive = true;
       liveStreamer = streamer_name;
@@ -214,9 +236,13 @@ async function pollLiveStatus() {
       updateStatus();
     }
   } catch (err) {
-    log.warn(`Live poll failed: ${err.message}`);
+    if (streamReachable) {
+      streamReachable = false;
+      log.warn(`Radio source unreachable (${err.message}) — pausing stream restarts until it returns.`);
+    }
   }
-  setTimeout(pollLiveStatus, LIVE_POLL_MS);
+  // While unreachable, poll faster so recovery is detected quickly; otherwise relax.
+  setTimeout(pollLiveStatus, streamReachable ? LIVE_POLL_MS : LIVE_POLL_FAST_MS);
 }
 
 // ── ICY metadata watcher ───────────────────────────────────────────────────
@@ -278,7 +304,30 @@ function fetchCurrentTitle() {
   });
 }
 
+let icyReq = null;             // the current ICY request (single-flight)
+let icyReconnectTimer = null;  // pending reconnect timer (never stacked)
+let icyBackoff = 5_000;        // grows on repeated failure, resets on connect
+const ICY_BACKOFF_MAX = 60_000;
+const ICY_IDLE_TIMEOUT = 20_000; // destroy a stalled connection after 20s of no data
+
+// Schedules exactly one backed-off ICY reconnect. Prevents the watcher from
+// hammering the server (and leaving lingering half-open connections) during an
+// outage — it used to blindly reconnect every 5s with no timeout.
+function scheduleIcyReconnect() {
+  if (icyReconnectTimer) return;
+  const delay = icyBackoff;
+  icyBackoff = Math.min(icyBackoff * 2, ICY_BACKOFF_MAX);
+  icyReconnectTimer = setTimeout(() => {
+    icyReconnectTimer = null;
+    watchIcyMetadata();
+  }, delay);
+}
+
 function watchIcyMetadata() {
+  // Single-flight: tear down any prior request before opening a new one so we
+  // never accumulate concurrent connections to the stream.
+  if (icyReq) { try { icyReq.destroy(); } catch {} icyReq = null; }
+
   const parsed = new URL(STREAM_URL);
   const req = https.get(
     { hostname: parsed.hostname, path: parsed.pathname, headers: { 'Icy-MetaData': '1', 'User-Agent': 'EphemeralRadioBot/1.0' } },
@@ -286,8 +335,9 @@ function watchIcyMetadata() {
       const metaint = parseInt(res.headers['icy-metaint'], 10);
       if (!metaint) {
         res.destroy();
-        return setTimeout(watchIcyMetadata, 10_000);
+        return scheduleIcyReconnect();
       }
+      icyBackoff = 5_000; // connected successfully — reset backoff
 
       let bytesUntilMeta = metaint;
       let readingMeta = false;
@@ -327,11 +377,15 @@ function watchIcyMetadata() {
         }
       });
 
-      res.on('end', () => setTimeout(watchIcyMetadata, 5_000));
-      res.on('error', () => setTimeout(watchIcyMetadata, 5_000));
+      res.on('end', scheduleIcyReconnect);
+      res.on('error', scheduleIcyReconnect);
     }
   );
-  req.on('error', () => setTimeout(watchIcyMetadata, 5_000));
+  icyReq = req;
+  // Destroy a stalled/half-open connection instead of letting it linger (which
+  // Icecast keeps counting as a listener) — then reconnect with backoff.
+  req.setTimeout(ICY_IDLE_TIMEOUT, () => req.destroy(new Error('ICY idle timeout')));
+  req.on('error', scheduleIcyReconnect);
 }
 
 // ── Audio stream ───────────────────────────────────────────────────────────
@@ -365,6 +419,7 @@ function killStream() {
 // (Re)starts the shared stream: kills any existing ffmpeg, spawns a fresh one,
 // and plays it on the global player. All subscribed guild connections receive it.
 function startStream() {
+  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
   killStream();
   const { resource, ffmpeg } = createStream();
   globalFfmpeg = ffmpeg;
@@ -387,27 +442,67 @@ function anyListeners() {
   return false;
 }
 
+// ── Stream supervisor (outage-aware, backed off) ───────────────────────────
+
+let restartTimer = null;              // the single pending restart timer (never stacked)
+let restartDelay = RESTART_BASE_MS;   // current backoff, grows on repeated failure
+let healthyTimer = null;              // resets backoff after sustained playback
+
+// Schedules exactly ONE backed-off stream (re)start. Guarantees a flapping or
+// unreachable source can never queue a burst of ffmpeg spawns — the root cause of
+// the listener-count spam during an outage.
+function scheduleStreamRestart() {
+  if (restartTimer) return;      // a restart is already pending — never stack them
+  if (!anyListeners()) return;   // nobody listening — nothing to restart
+
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    if (!anyListeners()) return;
+
+    if (!streamReachable) {
+      // Source is down — do NOT spawn ffmpeg (that's what floods the server).
+      // Just grow the backoff; the API poll will call ensureStream() on recovery.
+      restartDelay = Math.min(restartDelay * 2, RESTART_MAX_MS);
+      return;
+    }
+
+    if (globalPlayer.state.status === AudioPlayerStatus.Idle) {
+      log.info(`Restarting stream (backoff ${restartDelay / 1000}s).`);
+      startStream();
+      restartDelay = Math.min(restartDelay * 2, RESTART_MAX_MS); // grow for next failure
+    }
+  }, restartDelay);
+}
+
 // Runs the shared stream only while at least one real listener is present in any
 // guild's voice channel; otherwise stops it so the bot drops its radio connection
 // while sitting idle in a channel 24/7. Idempotent — safe to call on every
-// join/leave/rejoin/voiceStateUpdate.
+// join/leave/rejoin/voiceStateUpdate/recovery.
 function ensureStream() {
   if (!anyListeners()) {
     killStream();
     return;
   }
-  // Start only if the player is idle (no active resource). If it's already
-  // Playing/Buffering, a newly subscribed connection just joins the existing feed.
-  if (globalPlayer.state.status === AudioPlayerStatus.Idle) {
+  if (globalPlayer.state.status !== AudioPlayerStatus.Idle) return; // already playing/buffering
+  if (streamReachable) {
     startStream();
+  } else {
+    scheduleStreamRestart(); // wait for the source to come back
   }
 }
 
 // Create the one shared player up front and wire its lifecycle once.
 globalPlayer = createAudioPlayer();
 globalPlayer.on(AudioPlayerStatus.Idle, () => {
-  // Resource ended/errored. Restart shortly if anyone is still listening.
-  if (guildState.size > 0) setTimeout(ensureStream, 2_000);
+  // Resource ended/errored — schedule a backed-off restart if anyone's listening.
+  clearTimeout(healthyTimer);
+  scheduleStreamRestart();
+});
+globalPlayer.on(AudioPlayerStatus.Playing, () => {
+  // Reset the backoff only after the stream has held for 30s, so a rapidly
+  // flapping connection doesn't keep resetting it back to the base delay.
+  clearTimeout(healthyTimer);
+  healthyTimer = setTimeout(() => { restartDelay = RESTART_BASE_MS; }, 30_000);
 });
 globalPlayer.on('error', (err) => {
   log.error(`Shared player error: ${err.message}`);
@@ -415,55 +510,90 @@ globalPlayer.on('error', (err) => {
   // performs the actual restart — just log here.
 });
 
-// Schedules a rejoin attempt for a guild whose voice connection has been lost.
-// Shared by both the error handler and the Disconnected handler so both paths
-// use the same backoff/retry logic.
+// Builds a fresh voice connection for a guild, subscribes it to the shared
+// player, and waits until it's actually Ready. Throws if it never reaches Ready.
+async function joinAndSubscribe(guildId, guild) {
+  const state = guildState.get(guildId);
+  const g = guild ?? client.guilds.cache.get(guildId);
+  const connection = joinVoiceChannel({
+    channelId: state.voiceChannelId,
+    guildId,
+    adapterCreator: g.voiceAdapterCreator,
+    selfDeaf: false,
+  });
+  state.connection = connection;
+  connection.subscribe(globalPlayer);
+  attachDisconnectHandler(connection, guildId, g);
+  // joinVoiceChannel() is synchronous — wait for real readiness so we never
+  // declare success while the network is still down.
+  await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+}
+
+// Entry point for recovering a lost voice connection. Guarded by state.rejoining
+// so the error handler, Disconnected handler, and outage-recovery path can't spin
+// up competing rejoin loops (which would create duplicate connections).
 function scheduleRejoin(guildId, guild) {
   const state = guildState.get(guildId);
-  if (!state) return; // /stop was used, don't rejoin
+  if (!state) return;         // /stop was used, don't rejoin
+  if (state.rejoining) return; // a rejoin loop is already running for this guild
+  state.rejoining = true;
+  state.rejoinAttempts = 0;
+  attemptRejoin(guildId, guild);
+}
+
+// One iteration of the rejoin loop, with escalating backoff. Recurses on failure.
+function attemptRejoin(guildId, guild) {
+  const state = guildState.get(guildId);
+  if (!state) return; // /stop was used
 
   state.rejoinAttempts++;
   const DELAYS = [5, 15, 30, 45, 60];
   const delay = (DELAYS[state.rejoinAttempts - 1] ?? 60) * 1_000;
-  log.warn(`[${guildId}] Disconnected, rejoining in ${delay / 1000}s (attempt ${state.rejoinAttempts})`);
+  log.warn(`[${guildId}] Reconnecting voice in ${delay / 1000}s (attempt ${state.rejoinAttempts})`);
 
-  setTimeout(async () => {
+  state.rejoinTimer = setTimeout(async () => {
     const current = guildState.get(guildId);
     if (!current) return; // /stop was used while waiting
 
     try {
-      const g = guild ?? client.guilds.cache.get(guildId);
-      const newConnection = joinVoiceChannel({
-        channelId: current.voiceChannelId,
-        guildId,
-        adapterCreator: g.voiceAdapterCreator,
-        selfDeaf: false,
-      });
-      current.connection = newConnection;
-      newConnection.subscribe(globalPlayer);
-      attachDisconnectHandler(newConnection, guildId, g);
-
-      // Wait for the connection to actually be ready before declaring success.
-      // joinVoiceChannel() is synchronous — without this the success log fires
-      // immediately even when the network is still down.
-      await entersState(newConnection, VoiceConnectionStatus.Ready, 15_000);
-
+      await joinAndSubscribe(guildId, guild);
       current.rejoinAttempts = 0;
-      // The shared stream is likely already playing (other guilds keep it alive);
-      // ensureStream only (re)starts it if it had stopped while this was the last guild.
+      current.rejoining = false;
+      current.rejoinTimer = null;
       ensureStream();
       log.info(`[${guildId}] Successfully rejoined voice channel.`);
     } catch (err) {
       log.warn(`[${guildId}] Rejoin failed: ${err.message} — will retry.`);
-      // Destroy the partial connection if it wasn't already, then let
-      // scheduleRejoin try the next attempt (state is preserved so the
-      // attempt counter and backoff keep incrementing correctly).
       if (current.connection?.state?.status !== VoiceConnectionStatus.Destroyed) {
         current.connection?.destroy();
       }
-      scheduleRejoin(guildId, guild);
+      attemptRejoin(guildId, guild); // keep looping (rejoining stays true)
     }
   }, delay);
+}
+
+// Called when the radio source comes back after an outage. A network drop can
+// leave a voice connection as a stale "Ready" zombie — dead UDP path, but no
+// Disconnected event ever fires, so the normal rejoin path never triggers and
+// audio silently stops. So we proactively rebuild every guild's connection.
+async function rejoinAllGuilds() {
+  for (const [guildId, state] of guildState) {
+    if (state.rejoining) continue; // a backoff loop is already recovering this guild
+    state.rejoining = true;
+    if (state.rejoinTimer) { clearTimeout(state.rejoinTimer); state.rejoinTimer = null; }
+    try {
+      try { state.connection?.destroy(); } catch {}
+      await joinAndSubscribe(guildId, client.guilds.cache.get(guildId));
+      state.rejoinAttempts = 0;
+      state.rejoining = false;
+      log.info(`[${guildId}] Rebuilt voice connection after outage.`);
+      ensureStream();
+    } catch (err) {
+      log.warn(`[${guildId}] Post-outage rebuild failed: ${err.message} — retrying with backoff.`);
+      state.rejoining = false;         // release the guard so scheduleRejoin can take over
+      scheduleRejoin(guildId, client.guilds.cache.get(guildId));
+    }
+  }
 }
 
 // Attaches recovery logic to a voice connection. Re-usable so that a connection
@@ -576,6 +706,8 @@ client.once('clientReady', async () => {
         songChannelId: cfg.songChannelId ?? null,
         voiceChannelId: channel.id,
         rejoinAttempts: 0,
+        rejoining: false,
+        rejoinTimer: null,
       });
 
       attachDisconnectHandler(connection, guildId, guild);
@@ -625,6 +757,8 @@ client.on('interactionCreate', async (interaction) => {
       songChannelId: getGuildConfig(guildId).songChannelId ?? null,
       voiceChannelId: voiceChannel.id,
       rejoinAttempts: 0,
+      rejoining: false,
+      rejoinTimer: null,
     });
 
     attachDisconnectHandler(connection, guildId, guild);

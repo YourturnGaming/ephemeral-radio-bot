@@ -155,6 +155,8 @@ The bot will **automatically rejoin** its voice channel after a restart — no n
 
 - **One shared stream.** No matter how many servers the bot streams to, it opens a single connection to the radio source and fans that one audio feed out to every voice channel. So on the website's listener count the bot only ever shows as **1** listener while playing (plus 1 for the always-on title watcher), not one per server.
 - **Listener-aware.** The bot stays parked in its voice channel 24/7, but it only runs the stream while a real (non-bot) user is in the channel with it. When everyone leaves, it goes silent and drops the radio connection; when someone joins, it starts back up automatically.
+- **Outage-aware.** If the radio source becomes unreachable (e.g. your internet drops), the bot detects it via the metadata API and *stops* trying to reconnect the audio stream — instead of hammering the server with a new connection every couple of seconds. It reconnects automatically, with exponential backoff, once connectivity returns. This prevents the listener count from being inflated by stale/half-open connections during an outage.
+- **Voice recovery.** When connectivity returns, the bot rebuilds its Discord voice connections. A network drop can leave a voice connection as a stale "zombie" (still marked ready, but audio goes nowhere) without ever firing a disconnect event, so the bot proactively re-establishes them rather than waiting for an event that never comes.
 
 ---
 
