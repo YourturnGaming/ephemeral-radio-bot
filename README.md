@@ -9,11 +9,12 @@ A Discord bot that streams [Ephemeral FM](https://ephemeral.club) into your voic
 - 👥 Live listener count shown in bot status, `/play`, and `/nowplaying`
 - 🎙️ Live DJ detection — announces when a DJ goes live or ends their set
 - 🔔 Optional per-channel announcements for song changes and live DJ events
+- 📬 Personal DM alerts when a DJ goes live — users opt in themselves with `/subscribe`
 - 🔁 Auto-reconnects if the stream drops or the bot is kicked
-- 💾 Remembers your settings (announce channel, ping role, voice channel) across restarts
+- 💾 Remembers your settings (announce channel, ping role, voice channel, subscribers) across restarts
 - 🪶 Single shared stream — one connection to the radio source no matter how many servers it streams to
 - 💤 Only streams when someone's listening — stays parked in the channel 24/7 but goes silent (and drops the radio connection) when the channel is empty
-- `/play` `/stop` `/nowplaying` `/announce` `/songs` `/setrole` slash commands
+- `/play` `/stop` `/nowplaying` `/announce` `/songs` `/setrole` `/subscribe` `/help` slash commands
 
 ---
 
@@ -65,7 +66,7 @@ Stop the bot:
 docker compose down
 ```
 
-> Per-guild settings are stored in `./data/guilds.json`, which is mounted as a volume so they survive container rebuilds and recreations.
+> Settings are stored in `./data/` (`guilds.json` and `subscribers.json`), which is mounted as a volume so they survive container rebuilds and recreations.
 
 ---
 
@@ -125,27 +126,49 @@ By default Pelican will show the server as **Starting** forever because the egg 
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `/play` | Join your voice channel and start streaming. Shows current track and listener count. |
-| `/stop` | Stop streaming and leave the voice channel |
-| `/nowplaying` | Show the currently playing track and listener count |
-| `/announce` | Toggle live DJ announcements in the current channel (goes live / set ends). Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
-| `/songs` | Toggle song change announcements in the current channel. No role ping. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
-| `/setrole` | Set a role to ping on announcements (song changes, DJ going live/offline). Leave the role option blank to clear it. Requires **Manage Server** permission. |
+| Command | Where | Description |
+|---|---|---|
+| `/play` | Server | Join your voice channel and start streaming. Shows current track and listener count. |
+| `/stop` | Server | Stop streaming and leave the voice channel |
+| `/nowplaying` | Server | Show the currently playing track and listener count |
+| `/announce` | Server | Toggle live DJ announcements in the current channel (goes live / set ends). Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
+| `/songs` | Server | Toggle song change announcements in the current channel. No role ping. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
+| `/setrole` | Server | Set a role to ping on live DJ announcements. Leave the role option blank to clear it. Requires **Manage Server** permission. |
+| `/subscribe` | Server or DM | Toggle personal DM alerts for when a DJ goes live |
+| `/help` | Server or DM | List every command, with links to the site and this repo |
+
+Commands that need a server (voice channels, per-channel settings) are restricted to the **Guild** context, so they don't clutter the bot's command list in DMs. Only `/subscribe` and `/help` are available in DMs.
+
+---
+
+## Live DJ DM alerts
+
+Any user can opt in to a DM whenever a DJ goes live — no admin setup required:
+
+1. Run `/subscribe` (in any server with the bot, or in a DM with it)
+2. The bot sends a confirmation DM with **Keep alerts** / **Unsubscribe** buttons, so it's one click to back out
+3. From then on, each time a DJ goes live you get a DM with a link straight to the site
+
+Notes:
+
+- Subscriptions are **per user, not per server** — you get one DM per live set even if you share several servers with the bot
+- If your DMs are closed, `/subscribe` tells you instead of silently failing, and users who later close their DMs are pruned from the list automatically
+- Run `/subscribe` again (or hit the button) any time to stop
+- Alerts fire when a set **starts**. Channel announcements via `/announce` also cover set endings.
 
 ---
 
 ## Persistent Settings
 
-The bot saves per-server settings to `data/guilds.json` and restores them automatically on restart:
+The bot saves its settings to the `data/` directory and restores them automatically on restart:
 
-| Setting | Set by | Cleared by |
-|---|---|---|
-| Voice channel to stream in | `/play` | `/stop` |
-| Live DJ announcement channel | `/announce` | `/announce` (toggle off) |
-| Song announcement channel | `/songs` | `/songs` (toggle off) |
-| Ping role (live DJ only) | `/setrole @role` | `/setrole` (no role selected) |
+| Setting | Stored in | Set by | Cleared by |
+|---|---|---|---|
+| Voice channel to stream in | `guilds.json` | `/play` | `/stop` |
+| Live DJ announcement channel | `guilds.json` | `/announce` | `/announce` (toggle off) |
+| Song announcement channel | `guilds.json` | `/songs` | `/songs` (toggle off) |
+| Ping role (live DJ only) | `guilds.json` | `/setrole @role` | `/setrole` (no role selected) |
+| DM alert subscribers | `subscribers.json` | `/subscribe` | `/subscribe` (toggle off) |
 
 The bot will **automatically rejoin** its voice channel after a restart — no need to run `/play` again.
 
@@ -165,3 +188,25 @@ The bot will **automatically rejoin** its voice channel after a restart — no n
 | Variable | Description |
 |---|---|
 | `BOT_TOKEN` | Your Discord bot token |
+
+---
+
+## AI disclaimer
+
+This project was built with substantial help from AI. The majority of the code in this repository was written by [Claude Code](https://claude.com/claude-code) (Anthropic) working from my prompts, direction, and testing.
+
+What that means in practice:
+
+- Every feature was specified, reviewed, and tested by a human before being merged
+- Behaviour was verified against a real Discord bot in a Docker container, not just assumed to work from the code
+- Bugs found in testing were fed back and fixed, rather than shipped
+
+It's still worth reading the code yourself before running it — treat it like any other unfamiliar open-source project. If you spot something wrong, please open an issue.
+
+---
+
+## Disclaimer
+
+This is an unofficial, fan-made project. It is not affiliated with, endorsed by, or operated by Ephemeral FM. It simply plays their public stream and reads their public metadata API.
+
+If you enjoy the station, please listen at [ephemeral.club](https://ephemeral.club) directly — it sounds better than Discord's compressed audio, and it means the station gets an accurate listener count.

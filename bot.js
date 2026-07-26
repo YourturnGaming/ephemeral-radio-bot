@@ -6,6 +6,10 @@ const {
   Routes,
   SlashCommandBuilder,
   PermissionFlagsBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  InteractionContextType,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -113,6 +117,31 @@ function persistGuildConfig(guildId, patch) {
   saveConfig(guildConfig);
 }
 
+// ── Live DJ DM subscribers ─────────────────────────────────────────────────
+// Stored globally (not per-guild) because a DM isn't tied to a server — a user
+// who subscribes anywhere gets exactly one DM per live set, even if they share
+// several servers with the bot.
+
+const SUBS_FILE = path.join(DATA_DIR, 'subscribers.json');
+
+function loadSubscribers() {
+  try {
+    return new Set(JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8')));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSubscribers() {
+  try {
+    fs.writeFileSync(SUBS_FILE, JSON.stringify([...subscribers], null, 2));
+  } catch (err) {
+    log.error(`Failed to save subscribers: ${err.message}`);
+  }
+}
+
+const subscribers = loadSubscribers();
+
 // ── Use system ffmpeg if available, fall back to ffmpeg-static ─────────────
 let ffmpegBin = 'ffmpeg';
 try {
@@ -124,6 +153,8 @@ try {
 
 const STREAM_URL     = 'https://listen.ephemeral.club/listen/ephemeral/radio.mp3';
 const NOWPLAYING_API = 'https://listen.ephemeral.club/api/nowplaying/ephemeral';
+const SITE_URL       = 'https://ephemeral.club';
+const GITHUB_URL     = 'https://github.com/YourturnGaming/ephemeral-radio-bot';
 const LIVE_POLL_MS      = 30_000; // normal API poll interval
 const LIVE_POLL_FAST_MS = 5_000;  // poll faster while the source is unreachable (to detect recovery)
 
@@ -191,6 +222,53 @@ function announce(message) {
   }
 }
 
+// DMs every subscriber that a DJ has gone live, with a link button to the site
+// (Discord re-encodes voice audio, so the direct stream sounds noticeably better).
+// Sent sequentially with a small gap to stay clear of Discord's DM rate limits;
+// users who have DMs closed (error 50007) are dropped so we stop retrying them.
+async function notifyLive(streamerName) {
+  if (subscribers.size === 0) return;
+
+  const payload = {
+    content:
+      `🎙️ **${streamerName}** is now live on Ephemeral FM!\n\n` +
+      `🎧 Listening in Discord works, but Discord compresses the audio — ` +
+      `open the site below for full-quality sound.\n\n` +
+      '-# To stop these alerts, run `/subscribe` again — in any server we share, or right here in this DM.',
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setLabel('Listen at ephemeral.club')
+          .setStyle(ButtonStyle.Link)
+          .setURL(SITE_URL)
+          .setEmoji('🎧'),
+      ),
+    ],
+  };
+
+  const total = subscribers.size;
+  let sent = 0;
+  let pruned = 0;
+  for (const userId of [...subscribers]) {
+    try {
+      const user = await client.users.fetch(userId);
+      await user.send(payload);
+      sent++;
+    } catch (err) {
+      if (err.code === 50007) { // cannot send DMs to this user
+        subscribers.delete(userId);
+        pruned++;
+      } else {
+        log.warn(`DM to ${userId} failed: ${err.message}`);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  if (pruned) saveSubscribers();
+  log.info(`Live DM alerts sent to ${sent}/${total} subscribers${pruned ? ` (${pruned} pruned: DMs closed)` : ''}.`);
+}
+
 // Song change announcements — no role ping
 function announceSong(message) {
   for (const [, state] of guildState) {
@@ -224,7 +302,14 @@ async function pollLiveStatus() {
       liveStreamer = streamer_name;
       log.info(`Live DJ started: ${streamer_name} (${listenerCount} listeners)`);
       updateStatus();
-      announce(`🎙️ **${streamer_name}** is now live on Ephemeral FM!`);
+      announce(
+        `🎙️ **${streamer_name}** is now live on Ephemeral FM!\n` +
+        `🎧 For the best audio quality, listen direct at ${SITE_URL} — Discord compresses the stream.`
+      );
+      // Fire-and-forget: DMs are throttled and can take a while with many
+      // subscribers, so don't hold up the poll loop waiting on them.
+      notifyLive(streamer_name)
+        .catch((err) => log.warn(`Subscriber DM run failed: ${err.message}`));
     } else if (!is_live && isLive) {
       isLive = false;
       liveStreamer = '';
@@ -641,22 +726,33 @@ function attachDisconnectHandler(connection, guildId, guild) {
 
 // ── Slash commands ─────────────────────────────────────────────────────────
 
+// Commands that need a server (voice channels, per-guild config) are restricted
+// to the Guild context so they don't clutter the bot's DM command list. Only the
+// user-scoped commands (/subscribe, /help) are usable in DMs.
+const GUILD_ONLY = [InteractionContextType.Guild];
+const GUILD_AND_DM = [InteractionContextType.Guild, InteractionContextType.BotDM];
+
 const commands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Join your voice channel and stream Ephemeral FM'),
+    .setDescription('Join your voice channel and stream Ephemeral FM')
+    .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
     .setName('stop')
-    .setDescription('Stop the stream and leave the voice channel'),
+    .setDescription('Stop the stream and leave the voice channel')
+    .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
     .setName('nowplaying')
-    .setDescription('Show what is currently playing on Ephemeral FM'),
+    .setDescription('Show what is currently playing on Ephemeral FM')
+    .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
     .setName('announce')
-    .setDescription('Toggle live DJ announcements in this channel'),
+    .setDescription('Toggle live DJ announcements in this channel')
+    .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
     .setName('songs')
-    .setDescription('Toggle song change announcements in this channel'),
+    .setDescription('Toggle song change announcements in this channel')
+    .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
     .setName('setrole')
     .setDescription('Set (or clear) the role to ping on song/live announcements (Manage Server required)')
@@ -664,7 +760,16 @@ const commands = [
       opt.setName('role')
         .setDescription('Role to ping — leave blank to clear')
         .setRequired(false)
-    ),
+    )
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('subscribe')
+    .setDescription('Toggle DM alerts when a DJ goes live on Ephemeral FM')
+    .setContexts(GUILD_AND_DM),
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Show what this bot can do and how to use it')
+    .setContexts(GUILD_AND_DM),
 ].map((c) => c.toJSON());
 
 // ── Bot events ─────────────────────────────────────────────────────────────
@@ -721,10 +826,34 @@ client.once('clientReady', async () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+  // ── Subscription buttons (sent in DMs) ─────────────────────────────────
+  if (interaction.isButton()) {
+    if (interaction.customId === 'sub:cancel') {
+      subscribers.delete(interaction.user.id);
+      saveSubscribers();
+      log.info(`${interaction.user.tag} unsubscribed via button (${subscribers.size} total).`);
+      // Strip the buttons so the message can't be clicked twice.
+      await interaction.update({
+        content:
+          '🔕 **Unsubscribed** — you will not get DMs when a DJ goes live.\n' +
+          '-# Changed your mind? Run `/subscribe` again — in any server we share, or right here in this DM.',
+        components: [],
+      });
+    } else if (interaction.customId === 'sub:keep') {
+      await interaction.update({
+        content:
+          "🔔 **You're all set** — I'll DM you whenever a DJ goes live on Ephemeral FM.\n" +
+          '-# Want to stop later? Run `/subscribe` again — in any server we share, or right here in this DM.',
+        components: [],
+      });
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, guildId, guild, member } = interaction;
-  log.info(`[${guild?.name ?? guildId}] @${interaction.user.tag} used /${commandName}`);
+  log.info(`[${guild?.name ?? (guildId ? guildId : 'DM')}] @${interaction.user.tag} used /${commandName}`);
 
   // ── /play ──────────────────────────────────────────────────────────────
   if (commandName === 'play') {
@@ -855,6 +984,106 @@ client.on('interactionCreate', async (interaction) => {
       log.info(`[${guild?.name ?? guildId}] Ping role cleared by ${interaction.user.tag}`);
       await interaction.reply({ content: '🔕 Announcement pings cleared — no role will be pinged.', ephemeral: true });
     }
+  }
+
+  // ── /help ──────────────────────────────────────────────────────────────
+  if (commandName === 'help') {
+    const inDm = !guildId;
+
+    const lines = [
+      '**📻 Ephemeral Radio Bot**',
+      `Streams [Ephemeral FM](${SITE_URL}) into your voice channels, with live track info.`,
+      '',
+      '**Listening**',
+      '`/play` — join your voice channel and start streaming',
+      '`/stop` — stop streaming and leave the channel',
+      '`/nowplaying` — show the current track and listener count',
+      '',
+      '**Alerts**',
+      '`/subscribe` — DM you whenever a DJ goes live *(works in DMs too)*',
+      '`/announce` — post live DJ alerts in this channel',
+      '`/songs` — post every song change in this channel',
+      '',
+      '**Admin** *(requires Manage Server)*',
+      '`/setrole` — pick a role to ping on live DJ alerts. Leave the option blank to clear it.',
+      '',
+      '-# 🎧 Discord compresses audio — listen at ephemeral.club for full quality.',
+    ];
+
+    if (inDm) {
+      lines.splice(
+        lines.length - 1,
+        0,
+        "-# You're in a DM, so only `/subscribe` and `/help` are available here. The rest work in a server.",
+      );
+    }
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setLabel('GitHub')
+        .setStyle(ButtonStyle.Link)
+        .setURL(GITHUB_URL)
+        .setEmoji('📖'),
+      new ButtonBuilder()
+        .setLabel('Listen at ephemeral.club')
+        .setStyle(ButtonStyle.Link)
+        .setURL(SITE_URL)
+        .setEmoji('🎧'),
+    );
+
+    await interaction.reply({ content: lines.join('\n'), components: [row], ephemeral: true });
+  }
+
+  // ── /subscribe ─────────────────────────────────────────────────────────
+  if (commandName === 'subscribe') {
+    const userId = interaction.user.id;
+
+    if (subscribers.has(userId)) {
+      subscribers.delete(userId);
+      saveSubscribers();
+      log.info(`${interaction.user.tag} unsubscribed from live DM alerts (${subscribers.size} total).`);
+      return interaction.reply({
+        content: '🔕 **Unsubscribed** — you will no longer get DMs when a DJ goes live.\n-# Changed your mind? Just run `/subscribe` again.',
+        ephemeral: true,
+      });
+    }
+
+    // Confirm we can actually DM them before saving — otherwise they'd silently
+    // never receive alerts and assume the bot was broken. The buttons give them
+    // a one-click way out if they change their mind.
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('sub:keep')
+        .setLabel('Keep alerts')
+        .setStyle(ButtonStyle.Success)
+        .setEmoji('🔔'),
+      new ButtonBuilder()
+        .setCustomId('sub:cancel')
+        .setLabel('Unsubscribe')
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji('🔕'),
+    );
+
+    try {
+      await interaction.user.send({
+        content:
+          "🔔 **You're subscribed to Ephemeral FM live alerts!**\n" +
+          "I'll send you a DM here whenever a DJ goes live.\n\n" +
+          'Having second thoughts? Hit **Unsubscribe** below.\n' +
+          '-# You can also toggle alerts any time with `/subscribe` — in any server we share, or right here in this DM.',
+        components: [row],
+      });
+    } catch {
+      return interaction.reply({
+        content: "❌ I couldn't DM you. Enable **Direct Messages** for this server (Server Settings → Privacy Settings) and try again.",
+        ephemeral: true,
+      });
+    }
+
+    subscribers.add(userId);
+    saveSubscribers();
+    log.info(`${interaction.user.tag} subscribed to live DM alerts (${subscribers.size} total).`);
+    await interaction.reply({ content: '🔔 Subscribed! Check your DMs — I just sent a confirmation.', ephemeral: true });
   }
 });
 
