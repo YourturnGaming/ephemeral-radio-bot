@@ -600,8 +600,21 @@ globalPlayer.on('error', (err) => {
 async function joinAndSubscribe(guildId, guild) {
   const state = guildState.get(guildId);
   const g = guild ?? client.guilds.cache.get(guildId);
+
+  // Prefer the channel the bot is *actually* in over our stored one. If an admin
+  // just dragged the bot, a Disconnected event can fire before the
+  // voiceStateUpdate handler adopts the new channel — using the live value stops
+  // us rejoining the old channel and yanking the bot back. Falls back to the
+  // stored channel when the bot isn't in one (e.g. it was kicked).
+  const liveChannelId = g?.members?.me?.voice?.channelId;
+  const channelId = liveChannelId ?? state.voiceChannelId;
+  if (channelId !== state.voiceChannelId) {
+    state.voiceChannelId = channelId;
+    persistGuildConfig(guildId, { voiceChannelId: channelId });
+  }
+
   const connection = joinVoiceChannel({
-    channelId: state.voiceChannelId,
+    channelId,
     guildId,
     adapterCreator: g.voiceAdapterCreator,
     selfDeaf: false,
@@ -1093,11 +1106,30 @@ client.on('interactionCreate', async (interaction) => {
 client.on('voiceStateUpdate', (oldState, newState) => {
   const guildId = (newState.guild ?? oldState.guild)?.id;
   if (!guildId || !guildState.has(guildId)) return;
-  if (newState.member?.user?.bot) return; // ignore bot (incl. our own) voice changes
+  const state = guildState.get(guildId);
 
-  const botChannelId = guildState.get(guildId).voiceChannelId;
+  // ── The bot's own voice state changed ─────────────────────────────────
+  if (newState.id === client.user.id) {
+    // An admin dragged the bot to another channel. Follow it: adopt the new
+    // channel as ours so the listener check and any future rejoin target the
+    // right place. Without this the stored channel goes stale, the listener
+    // check inspects the OLD (now empty) channel, and the stream gets killed.
+    if (newState.channelId && newState.channelId !== state.voiceChannelId) {
+      const from = oldState.channelId;
+      state.voiceChannelId = newState.channelId;
+      persistGuildConfig(guildId, { voiceChannelId: newState.channelId });
+      log.info(`[${newState.guild?.name ?? guildId}] Moved ${from ? `from ${from} ` : ''}to ${newState.channelId} — following.`);
+      ensureStream(); // start if the new channel has listeners; no-op if already playing
+    }
+    // channelId === null means fully disconnected — the connection's own
+    // Disconnected/error handlers own that recovery path, so nothing to do here.
+    return;
+  }
+
+  if (newState.member?.user?.bot) return; // ignore other bots joining/leaving
+
   // Only react when the change involves the bot's channel (someone joined or left it).
-  if (oldState.channelId !== botChannelId && newState.channelId !== botChannelId) return;
+  if (oldState.channelId !== state.voiceChannelId && newState.channelId !== state.voiceChannelId) return;
 
   ensureStream();
 });
