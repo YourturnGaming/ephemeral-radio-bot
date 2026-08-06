@@ -7,5 +7,45 @@ services:
       - .env
     volumes:
       # Persist per-guild settings (announce/song channels, ping role, voice
-      # channel) across container rebuilds and recreations.
+      # channel), DM subscribers, and live DJ state across container rebuilds
+      # and recreations.
       - ./data:/app/data
+      # Mount a CA certificate here (read-only) if your external database uses
+      # a self-signed cert, then set DB_SSL_CA=/app/certs/ca.pem in .env.
+      #- ./certs:/app/certs:ro
+    # Deliberately no depends_on. Compose's profile/dependency interaction would
+    # risk pulling the mariadb service in for deployments that use an external
+    # database, and the bot doesn't need the ordering anyway — db.js retries the
+    # connection with backoff until it succeeds, so booting before the database
+    # is ready costs nothing but a log line.
+
+  # Only started when COMPOSE_PROFILES=local-db is set in .env. Deployments
+  # using their own database server leave that unset, and this never runs.
+  mariadb:
+    image: mariadb:11
+    container_name: ephemeral-mariadb
+    restart: unless-stopped
+    profiles:
+      - local-db
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+      MARIADB_DATABASE: ${DB_NAME:-ephemeral_bot}
+      MARIADB_USER: ${DB_USER:-ephemeral_bot}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    # No ports are published. The bot reaches it over the private compose
+    # network; exposing 3306 to the host would put the database on the internet
+    # for the sake of a connection that already works.
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  mariadb-data:

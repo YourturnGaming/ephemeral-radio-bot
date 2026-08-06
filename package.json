@@ -9,6 +9,7 @@
     "opusscript": "^0.1.1",
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.16.0",
+    "mysql2": "^3.11.0",
     "tweetnacl": "^1.0.3",
     "ffmpeg-static": "^5.2.0",
     "dotenv": "^16.0.0"

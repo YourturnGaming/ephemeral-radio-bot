@@ -11,6 +11,7 @@ const {
   ButtonStyle,
   ChannelType,
   InteractionContextType,
+  MessageFlags,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -27,6 +28,7 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 const log = require('./logger');
+const db = require('./db');
 
 // ── Crash handling ─────────────────────────────────────────────────────────
 
@@ -59,8 +61,28 @@ function cleanupAllStreams() {
   }
 }
 
-process.on('SIGTERM', () => { cleanupAllStreams(); process.exit(0); });
-process.on('SIGINT',  () => { cleanupAllStreams(); process.exit(0); });
+// Graceful shutdown. Audio is torn down first and synchronously — that must
+// happen even if everything else hangs. Open listen sessions are then flushed so
+// a restart doesn't leave them dangling, but behind a short timeout: a wedged
+// database must not stop the container from stopping.
+let shuttingDown = false;
+
+async function shutdown(code) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  cleanupAllStreams();
+  try {
+    await Promise.race([
+      closeAllSessions(),
+      new Promise((r) => setTimeout(r, 3_000)),
+    ]);
+    await db.close();
+  } catch {}
+  process.exit(code);
+}
+
+process.on('SIGTERM', () => { shutdown(0); });
+process.on('SIGINT',  () => { shutdown(0); });
 
 process.on('uncaughtException', (err) => {
   if (isRecoverableNetError(err)) {
@@ -335,11 +357,11 @@ function notifyLiveEnded(streamerName) {
 }
 
 // Song change announcements — no role ping
-function announceSong(message) {
+function announceSong(message, components = []) {
   for (const [, state] of guildState) {
     if (state.songChannelId) {
       const channel = client.channels.cache.get(state.songChannelId);
-      channel?.send(message).catch(() => {});
+      channel?.send({ content: message, components }).catch(() => {});
     }
   }
 }
@@ -412,6 +434,7 @@ async function pollLiveStatus() {
 // ── ICY metadata watcher ───────────────────────────────────────────────────
 
 let currentTitle = null; // null until first metadata block arrives
+let currentSong = null;  // the API's song object — the only source of a stable id
 
 function parseIcyTitle(metaStr) {
   const match = metaStr.match(/StreamTitle='([^']*)'/);
@@ -529,10 +552,11 @@ function watchIcyMetadata() {
               if (title && title !== currentTitle) {
                 currentTitle = title;
                 log.info(`Now playing: ${title}`);
-                if (!isLive) {
-                  updateStatus();
-                  announceSong(`🎵 Now playing: **${title}**`);
-                }
+                updateStatus();
+                // ICY is the fastest signal that the track changed, but it only
+                // carries a display string. Resolving identity and announcing is
+                // handled separately so the announcement can carry a real song id.
+                onTrackChanged(title).catch((err) => log.warn(`Track change handling failed: ${err.message}`));
               }
               readingMeta = false;
               bytesUntilMeta = metaint;
@@ -661,8 +685,10 @@ globalPlayer.on(AudioPlayerStatus.Idle, () => {
   // Resource ended/errored — schedule a backed-off restart if anyone's listening.
   clearTimeout(healthyTimer);
   scheduleStreamRestart();
+  reconcileSessions(); // audio stopped — nobody is listening through it now
 });
 globalPlayer.on(AudioPlayerStatus.Playing, () => {
+  reconcileSessions(); // audio is flowing — start counting whoever's present
   // Reset the backoff only after the stream has held for 30s, so a rapidly
   // flapping connection doesn't keep resetting it back to the base delay.
   clearTimeout(healthyTimer);
@@ -851,6 +877,302 @@ function attachDisconnectHandler(connection, guildId, guild) {
   });
 }
 
+// ── Listener stats ─────────────────────────────────────────────────────────
+// Records how long each user actually spends listening. Entirely optional: with
+// DB_HOST unset every function here is a no-op and the bot behaves as before.
+
+const SESSION_HEARTBEAT_MS = 60_000;
+
+// `${guildId}:${discordId}` → { id } of the open row in `sessions`.
+const openSessions = new Map();
+
+// Cached so the reconcile below doesn't hit the database on every voice event.
+const optedOut = new Set();
+
+async function loadOptOuts() {
+  const rows = await db.query('SELECT discord_id FROM users WHERE opted_out = 1');
+  if (!rows) return;
+  optedOut.clear();
+  for (const row of rows) optedOut.add(row.discord_id);
+  if (optedOut.size) log.info(`${optedOut.size} user(s) opted out of listener stats.`);
+}
+
+// Who should have an open session right now. A session is time spent genuinely
+// able to hear the station, so all three have to hold: the shared player is
+// actually playing, the user is in the bot's channel, and they aren't deafened.
+// Without the deafen check this measures "sat in a channel", not "listened".
+function currentListeners() {
+  const listeners = [];
+  if (globalPlayer.state.status !== AudioPlayerStatus.Playing) return listeners;
+
+  for (const [guildId, state] of guildState) {
+    const channel = client.guilds.cache.get(guildId)?.channels?.cache?.get(state.voiceChannelId);
+    if (!channel) continue;
+    for (const [, member] of channel.members) {
+      if (member.user.bot) continue;
+      if (member.voice.deaf || member.voice.selfDeaf) continue; // present, not listening
+      if (optedOut.has(member.id)) continue;
+      listeners.push({ discordId: member.id, guildId, channelId: channel.id });
+    }
+  }
+  return listeners;
+}
+
+async function openSession(key, { discordId, guildId, channelId }) {
+  await db.query(
+    `INSERT INTO users (discord_id, first_seen, last_seen) VALUES (?, NOW(3), NOW(3))
+     ON DUPLICATE KEY UPDATE last_seen = NOW(3)`,
+    [discordId],
+  );
+  const result = await db.query(
+    `INSERT INTO sessions (discord_id, guild_id, channel_id, started_at, last_seen_at)
+     VALUES (?, ?, ?, NOW(3), NOW(3))`,
+    [discordId, guildId, channelId],
+  );
+  // If the insert failed we deliberately don't record it as open — an entry we
+  // can't close later would leak and be "recovered" as bogus listening time.
+  if (result?.insertId) openSessions.set(key, { id: result.insertId, discordId });
+}
+
+async function closeSession(key) {
+  const session = openSessions.get(key);
+  if (!session) return;
+  openSessions.delete(key); // removed before awaiting, so a concurrent pass can't double-close
+  await db.query(
+    `UPDATE sessions
+        SET ended_at = NOW(3), last_seen_at = NOW(3),
+            seconds = TIMESTAMPDIFF(SECOND, started_at, NOW(3))
+      WHERE id = ? AND ended_at IS NULL`,
+    [session.id],
+  );
+}
+
+// Idempotent reconcile of desired vs open sessions — the same shape as
+// ensureStream(), and safe to call from any event that could change the answer
+// (join, leave, deafen, /play, /stop, /move, player start/stop). Reconciling
+// rather than applying event deltas means a missed or out-of-order event
+// self-corrects on the next call instead of leaking a session forever.
+let reconciling = false;
+let reconcileAgain = false;
+
+async function reconcileSessions() {
+  if (!db.enabled || !db.ready) return;
+  if (reconciling) { reconcileAgain = true; return; } // re-run after, don't interleave
+  reconciling = true;
+  try {
+    do {
+      reconcileAgain = false;
+      const wanted = new Map(currentListeners().map((l) => [`${l.guildId}:${l.discordId}`, l]));
+
+      for (const [key, listener] of wanted) {
+        if (!openSessions.has(key)) await openSession(key, listener);
+      }
+      for (const key of [...openSessions.keys()]) {
+        if (!wanted.has(key)) await closeSession(key);
+      }
+    } while (reconcileAgain);
+  } finally {
+    reconciling = false;
+  }
+}
+
+// Rows still open in the table belong to a previous run that didn't shut down
+// cleanly. Close them at their last heartbeat, not at now — otherwise the bot's
+// entire downtime is credited as listening time.
+async function closeDanglingSessions() {
+  const result = await db.query(
+    `UPDATE sessions
+        SET ended_at = last_seen_at,
+            seconds = TIMESTAMPDIFF(SECOND, started_at, last_seen_at)
+      WHERE ended_at IS NULL`,
+  );
+  if (result?.affectedRows) {
+    log.info(`Closed ${result.affectedRows} dangling listen session(s) from a previous run.`);
+  }
+}
+
+async function closeAllSessions() {
+  for (const key of [...openSessions.keys()]) await closeSession(key);
+}
+
+// Keeps open rows fresh so an unclean exit loses at most one heartbeat of time,
+// and re-reconciles periodically to catch anything the events missed.
+function startSessionHeartbeat() {
+  setInterval(async () => {
+    const ids = [...openSessions.values()].map((s) => s.id);
+    if (ids.length) {
+      await db.query(
+        `UPDATE sessions
+            SET last_seen_at = NOW(3),
+                seconds = TIMESTAMPDIFF(SECOND, started_at, NOW(3))
+          WHERE id IN (?)`,
+        [ids],
+      );
+    }
+    reconcileSessions();
+  }, SESSION_HEARTBEAT_MS);
+}
+
+// Open sessions haven't had their `seconds` column written since the last
+// heartbeat, so totals compute the in-progress slice live rather than reading a
+// value that could be up to a minute stale.
+const LISTENED_SECONDS = `
+  SUM(CASE WHEN ended_at IS NULL
+           THEN TIMESTAMPDIFF(SECOND, started_at, NOW(3))
+           ELSE seconds END)`;
+
+function formatDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours === 0 && minutes === 0) return `${seconds}s`;
+  if (hours === 0) return `${minutes}m`;
+  return `${hours}h ${minutes}m`;
+}
+
+// ── Track identity and ratings ─────────────────────────────────────────────
+// Ratings can't key off the ICY title — it's a display string with no stable
+// identity, so punctuation drift or a re-tag would orphan every existing rating.
+// The nowplaying API returns song.id, a stable hash, and that's what's stored.
+
+async function fetchNowPlayingSong() {
+  try {
+    const res = await fetch(NOWPLAYING_API);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.now_playing?.song ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Records a track's metadata without counting an airing. Ratings and favourites
+// join against this table, so a song MUST exist here before it can be rated —
+// otherwise the rating is written, joins to nothing, and is invisible to
+// /toptracks and /favourites with no error anywhere.
+async function upsertTrack(song) {
+  await db.query(
+    `INSERT INTO tracks (song_id, artist, title, album, genre, art_url, first_seen)
+     VALUES (?, ?, ?, ?, ?, ?, NOW(3))
+     ON DUPLICATE KEY UPDATE
+       artist = VALUES(artist), title = VALUES(title), album = VALUES(album),
+       genre  = VALUES(genre),  art_url = VALUES(art_url)`,
+    [song.id, song.artist ?? '', song.title ?? '', song.album ?? '', song.genre ?? '', song.art ?? ''],
+  );
+}
+
+async function recordPlay(song) {
+  await upsertTrack(song);
+  await db.query('UPDATE tracks SET play_count = play_count + 1 WHERE song_id = ?', [song.id]);
+  await db.query(
+    'INSERT INTO plays (song_id, started_at, is_live, streamer_name) VALUES (?, NOW(3), ?, ?)',
+    [song.id, isLive ? 1 : 0, liveStreamer ?? ''],
+  );
+}
+
+// Buttons carry the song id, not "whatever is playing now". A message sits in
+// the channel long after the track has moved on, and a late click should rate
+// the song it was posted for — not whatever happens to be on air at the time.
+function ratingButtons(songId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`rate:like:${songId}`).setLabel('Like').setStyle(ButtonStyle.Secondary).setEmoji('👍'),
+    new ButtonBuilder().setCustomId(`rate:dislike:${songId}`).setLabel('Dislike').setStyle(ButtonStyle.Secondary).setEmoji('👎'),
+    new ButtonBuilder().setCustomId(`rate:fav:${songId}`).setLabel('Favourite').setStyle(ButtonStyle.Secondary).setEmoji('⭐'),
+  );
+}
+
+// Called when ICY reports a new title. Resolves identity from the API, records
+// the play, and posts the announcement with rating buttons attached.
+async function onTrackChanged(icyTitle) {
+  const previousId = currentSong?.id ?? null;
+
+  let song = await fetchNowPlayingSong();
+  // ICY can run ahead of the API. If the API still reports the track we already
+  // knew about, give it a moment and ask once more rather than attributing this
+  // play — and any rating clicked on it — to the previous song.
+  if (song && previousId && song.id === previousId) {
+    await new Promise((r) => setTimeout(r, 3_000));
+    song = (await fetchNowPlayingSong()) ?? song;
+  }
+
+  // The API still reports the track we already knew about, so nothing genuinely
+  // turned over — this is a restart re-reading the current track, or a metadata
+  // refresh on the same song. Recording a second airing would inflate play
+  // counts every time the bot restarts, and re-announcing would be noise.
+  if (song && previousId && song.id === previousId) return;
+
+  const resolved = song ?? null;
+  if (resolved) {
+    currentSong = resolved;
+    await recordPlay(resolved);
+  }
+
+  // Per-track announcements stay suppressed during a live set — the DJ is the
+  // event, not each record. The play is still recorded above, flagged is_live.
+  if (isLive) return;
+
+  // Falls back to the ICY title with no buttons if the API couldn't be reached.
+  // A degraded announcement beats no announcement.
+  const label = resolved ? `${resolved.artist} — ${resolved.title}`.trim() : icyTitle;
+  const buttons = resolved && db.enabled ? [ratingButtons(resolved.id)] : [];
+  announceSong(`🎵 Now playing: **${label}**`, buttons);
+}
+
+// Shared by the buttons and the /like, /dislike and /favourite commands, so the
+// two routes can't drift apart. Returns a message to show the user.
+async function applyRating(userId, songId, action) {
+  if (optedOut.has(userId)) {
+    return "🚫 You're opted out of data collection, so ratings aren't saved. Run `/optout` again to opt back in.";
+  }
+
+  await db.query(
+    `INSERT INTO users (discord_id, first_seen, last_seen) VALUES (?, NOW(3), NOW(3))
+     ON DUPLICATE KEY UPDATE last_seen = NOW(3)`,
+    [userId],
+  );
+
+  // Guarantee the track exists before rating it. The song playing at startup is
+  // primed into currentSong without recording an airing, so it has no tracks row
+  // until it next comes round — rating it before then would store a row that
+  // joins to nothing. Buttons on older messages are already covered, since
+  // announcing a track is what recorded it in the first place.
+  if (currentSong?.id === songId) await upsertTrack(currentSong);
+
+  if (action === 'fav') {
+    const existing = await db.query('SELECT 1 FROM favourites WHERE discord_id = ? AND song_id = ?', [userId, songId]);
+    if (existing === null) return '⚠️ Stats are temporarily unavailable — try again shortly.';
+    if (existing.length) {
+      await db.query('DELETE FROM favourites WHERE discord_id = ? AND song_id = ?', [userId, songId]);
+      return '⭐ Removed from your favourites.';
+    }
+    const ok = await db.query(
+      'INSERT INTO favourites (discord_id, song_id, added_at) VALUES (?, ?, NOW(3))',
+      [userId, songId],
+    );
+    if (!ok) return '⚠️ Stats are temporarily unavailable — try again shortly.';
+    return '⭐ Added to your favourites — see them with `/favourites`.';
+  }
+
+  const value = action === 'like' ? 1 : -1;
+  const existing = await db.query('SELECT value FROM ratings WHERE discord_id = ? AND song_id = ?', [userId, songId]);
+  if (existing === null) return '⚠️ Stats are temporarily unavailable — try again shortly.';
+
+  // Clicking the same button again clears the rating, so there's a way to undo
+  // a misclick without a separate command.
+  if (existing.length && existing[0].value === value) {
+    await db.query('DELETE FROM ratings WHERE discord_id = ? AND song_id = ?', [userId, songId]);
+    return value === 1 ? '👍 Like removed.' : '👎 Dislike removed.';
+  }
+
+  const ok = await db.query(
+    `INSERT INTO ratings (discord_id, song_id, value, rated_at) VALUES (?, ?, ?, NOW(3))
+     ON DUPLICATE KEY UPDATE value = VALUES(value), rated_at = VALUES(rated_at)`,
+    [userId, songId, value],
+  );
+  if (!ok) return '⚠️ Stats are temporarily unavailable — try again shortly.';
+  return value === 1 ? '👍 Liked.' : '👎 Disliked.';
+}
+
 // ── Slash commands ─────────────────────────────────────────────────────────
 
 // Commands that need a server (voice channels, per-guild config) are restricted
@@ -904,6 +1226,47 @@ const commands = [
     )
     .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
+    .setName('listentime')
+    .setDescription('Show how long you (or someone else) have listened to Ephemeral FM')
+    .addUserOption((opt) =>
+      opt.setName('user')
+        .setDescription('Whose listening time to show — defaults to you')
+        .setRequired(false)
+    )
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('toplisteners')
+    .setDescription('Show the longest-listening users')
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('like')
+    .setDescription('Like the track currently playing')
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('dislike')
+    .setDescription('Dislike the track currently playing')
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('favourite')
+    .setDescription('Save the track currently playing to your favourites')
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('favourites')
+    .setDescription('List the tracks you have favourited')
+    .setContexts(GUILD_AND_DM),
+  new SlashCommandBuilder()
+    .setName('toptracks')
+    .setDescription('Show the most liked tracks on Ephemeral FM')
+    .setContexts(GUILD_ONLY),
+  new SlashCommandBuilder()
+    .setName('optout')
+    .setDescription('Toggle whether your listening time is recorded')
+    .setContexts(GUILD_AND_DM),
+  new SlashCommandBuilder()
+    .setName('forgetme')
+    .setDescription('Delete all listening data stored about you')
+    .setContexts(GUILD_AND_DM),
+  new SlashCommandBuilder()
     .setName('subscribe')
     .setDescription('Toggle DM alerts when a DJ goes live on Ephemeral FM')
     .setContexts(GUILD_AND_DM),
@@ -926,6 +1289,22 @@ client.once('clientReady', async () => {
   } catch (err) {
     log.error(`Failed to register commands: ${err.message}`);
   }
+
+  // Deliberately not awaited: db.init() retries for as long as the database is
+  // unreachable, and nothing about streaming should wait on it.
+  db.init().then(async (connected) => {
+    if (!connected) return;
+    await loadOptOuts();
+    await closeDanglingSessions();
+    startSessionHeartbeat();
+    reconcileSessions();
+  });
+
+  // Prime the current track before the metadata watcher starts. The first ICY
+  // block after connecting always looks like a change (currentTitle is null), so
+  // without this every restart would log the track already on air as a fresh
+  // airing and re-announce it.
+  currentSong = await fetchNowPlayingSong();
 
   watchIcyMetadata();
 
@@ -978,6 +1357,20 @@ client.once('clientReady', async () => {
 client.on('interactionCreate', async (interaction) => {
   // ── Subscription buttons (sent in DMs) ─────────────────────────────────
   if (interaction.isButton()) {
+    // ── Rating buttons on now-playing messages ───────────────────────────
+    if (interaction.customId.startsWith('rate:')) {
+      const [, action, songId] = interaction.customId.split(':');
+      if (!db.enabled) {
+        return interaction.reply({ content: 'Ratings are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+      }
+      // Deferred first: a wedged database can outlast Discord's 3s window to
+      // acknowledge an interaction, and the user would just see "interaction
+      // failed". Ephemeral so a busy song channel doesn't fill with receipts.
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      await interaction.editReply(await applyRating(interaction.user.id, songId, action));
+      return;
+    }
+
     if (interaction.customId === 'sub:cancel') {
       subscribers.delete(interaction.user.id);
       saveSubscribers();
@@ -1009,7 +1402,7 @@ client.on('interactionCreate', async (interaction) => {
   if (commandName === 'play') {
     const voiceChannel = member?.voice?.channel;
     if (!voiceChannel) {
-      return interaction.reply({ content: 'You need to be in a voice channel first.', ephemeral: true });
+      return interaction.reply({ content: 'You need to be in a voice channel first.', flags: MessageFlags.Ephemeral });
     }
 
     await interaction.deferReply();
@@ -1061,7 +1454,7 @@ client.on('interactionCreate', async (interaction) => {
   // ── /stop ──────────────────────────────────────────────────────────────
   if (commandName === 'stop') {
     if (!guildState.has(guildId)) {
-      return interaction.reply({ content: 'Not currently streaming.', ephemeral: true });
+      return interaction.reply({ content: 'Not currently streaming.', flags: MessageFlags.Ephemeral });
     }
     const stopping = guildState.get(guildId);
     stopping.connection.destroy();
@@ -1070,6 +1463,7 @@ client.on('interactionCreate', async (interaction) => {
     // If that was the last guild listening, stop the shared stream entirely so
     // the bot stops being a listener on the radio source.
     ensureStream();
+    reconcileSessions(); // the guild is out of guildState, so its sessions close
     await interaction.reply('Stopped streaming and left the voice channel.');
   }
 
@@ -1081,33 +1475,33 @@ client.on('interactionCreate', async (interaction) => {
     const canMove = interaction.memberPermissions?.has(PermissionFlagsBits.MoveMembers)
       || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
     if (!canMove) {
-      return interaction.reply({ content: 'You need the **Move Members** or **Manage Server** permission to use this command.', ephemeral: true });
+      return interaction.reply({ content: 'You need the **Move Members** or **Manage Server** permission to use this command.', flags: MessageFlags.Ephemeral });
     }
 
     const state = guildState.get(guildId);
     if (!state) {
-      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', ephemeral: true });
+      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', flags: MessageFlags.Ephemeral });
     }
 
     // No channel given → "follow me": bring the bot to the caller's channel.
     const target = interaction.options.getChannel('channel') ?? member?.voice?.channel;
     if (!target) {
-      return interaction.reply({ content: 'Join a voice channel first, or pick one with the `channel` option.', ephemeral: true });
+      return interaction.reply({ content: 'Join a voice channel first, or pick one with the `channel` option.', flags: MessageFlags.Ephemeral });
     }
     // Stage channels join as a suppressed audience member, so the bot would sit
     // there streaming to nobody — reject them rather than fail silently.
     if (target.type !== ChannelType.GuildVoice) {
-      return interaction.reply({ content: 'That is not a regular voice channel — stage channels are not supported.', ephemeral: true });
+      return interaction.reply({ content: 'That is not a regular voice channel — stage channels are not supported.', flags: MessageFlags.Ephemeral });
     }
     if (target.id === state.voiceChannelId) {
-      return interaction.reply({ content: `Already streaming in **${target.name}**.`, ephemeral: true });
+      return interaction.reply({ content: `Already streaming in **${target.name}**.`, flags: MessageFlags.Ephemeral });
     }
 
     // Checked up front so a missing permission reads as a clear message instead
     // of a connection that silently never reaches Ready.
     const perms = guild?.members?.me ? target.permissionsFor(guild.members.me) : null;
     if (!perms?.has(PermissionFlagsBits.Connect) || !perms.has(PermissionFlagsBits.Speak)) {
-      return interaction.reply({ content: `I need **Connect** and **Speak** in **${target.name}** to stream there.`, ephemeral: true });
+      return interaction.reply({ content: `I need **Connect** and **Speak** in **${target.name}** to stream there.`, flags: MessageFlags.Ephemeral });
     }
 
     await interaction.deferReply();
@@ -1128,24 +1522,25 @@ client.on('interactionCreate', async (interaction) => {
       ? `🎙️ LIVE: **${liveStreamer}**\n🎵 ${currentTitle ?? 'Ephemeral FM'}`
       : `🎵 ${currentTitle ?? 'Ephemeral FM'}`;
     const listenersLine = listenerCount > 0 ? `\n👥 **${listenerCount}** listeners` : '';
-    await interaction.reply(`${trackLine}${listenersLine}`);
+    const components = db.enabled && currentSong?.id ? [ratingButtons(currentSong.id)] : [];
+    await interaction.reply({ content: `${trackLine}${listenersLine}`, components });
   }
 
   // ── /announce ──────────────────────────────────────────────────────────
   if (commandName === 'announce') {
     const state = guildState.get(guildId);
     if (!state) {
-      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', ephemeral: true });
+      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', flags: MessageFlags.Ephemeral });
     }
 
     if (state.announceChannelId === interaction.channelId) {
       state.announceChannelId = null;
       persistGuildConfig(guildId, { announceChannelId: null });
-      await interaction.reply({ content: '🔕 Live DJ announcements turned **off**.', ephemeral: true });
+      await interaction.reply({ content: '🔕 Live DJ announcements turned **off**.', flags: MessageFlags.Ephemeral });
     } else {
       state.announceChannelId = interaction.channelId;
       persistGuildConfig(guildId, { announceChannelId: interaction.channelId });
-      await interaction.reply({ content: `🔔 Live DJ announcements turned **on** in this channel.`, ephemeral: true });
+      await interaction.reply({ content: `🔔 Live DJ announcements turned **on** in this channel.`, flags: MessageFlags.Ephemeral });
     }
   }
 
@@ -1153,36 +1548,246 @@ client.on('interactionCreate', async (interaction) => {
   if (commandName === 'songs') {
     const state = guildState.get(guildId);
     if (!state) {
-      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', ephemeral: true });
+      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', flags: MessageFlags.Ephemeral });
     }
 
     if (state.songChannelId === interaction.channelId) {
       state.songChannelId = null;
       persistGuildConfig(guildId, { songChannelId: null });
-      await interaction.reply({ content: '🔕 Song announcements turned **off**.', ephemeral: true });
+      await interaction.reply({ content: '🔕 Song announcements turned **off**.', flags: MessageFlags.Ephemeral });
     } else {
       state.songChannelId = interaction.channelId;
       persistGuildConfig(guildId, { songChannelId: interaction.channelId });
-      await interaction.reply({ content: '🎵 Song announcements turned **on** in this channel.', ephemeral: true });
+      await interaction.reply({ content: '🎵 Song announcements turned **on** in this channel.', flags: MessageFlags.Ephemeral });
     }
   }
 
   // ── /setrole ───────────────────────────────────────────────────────────
   if (commandName === 'setrole') {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.reply({ content: 'You need the **Manage Server** permission to use this command.', ephemeral: true });
+      return interaction.reply({ content: 'You need the **Manage Server** permission to use this command.', flags: MessageFlags.Ephemeral });
     }
 
     const role = interaction.options.getRole('role');
     if (role) {
       persistGuildConfig(guildId, { pingRoleId: role.id });
       log.info(`[${guild?.name ?? guildId}] Ping role set to @${role.name} by ${interaction.user.tag}`);
-      await interaction.reply({ content: `🔔 Announcement pings set to ${role}. This role will be mentioned on song and live DJ changes.`, ephemeral: true });
+      await interaction.reply({ content: `🔔 Announcement pings set to ${role}. This role will be mentioned on song and live DJ changes.`, flags: MessageFlags.Ephemeral });
     } else {
       persistGuildConfig(guildId, { pingRoleId: null });
       log.info(`[${guild?.name ?? guildId}] Ping role cleared by ${interaction.user.tag}`);
-      await interaction.reply({ content: '🔕 Announcement pings cleared — no role will be pinged.', ephemeral: true });
+      await interaction.reply({ content: '🔕 Announcement pings cleared — no role will be pinged.', flags: MessageFlags.Ephemeral });
     }
+  }
+
+  // ── /like, /dislike, /favourite ────────────────────────────────────────
+  if (commandName === 'like' || commandName === 'dislike' || commandName === 'favourite') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Ratings are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+    if (!currentSong?.id) {
+      return interaction.reply({ content: "I don't know what's playing right now — try again in a moment.", flags: MessageFlags.Ephemeral });
+    }
+
+    const action = commandName === 'favourite' ? 'fav' : commandName;
+    const song = currentSong; // captured before awaiting, in case the track turns over
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const result = await applyRating(interaction.user.id, song.id, action);
+    await interaction.editReply(`${result}\n-# ${song.artist} — ${song.title}`);
+  }
+
+  // ── /favourites ────────────────────────────────────────────────────────
+  if (commandName === 'favourites') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Ratings are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const rows = await db.query(
+      `SELECT t.artist, t.title
+         FROM favourites f
+         JOIN tracks t ON t.song_id = f.song_id
+        WHERE f.discord_id = ?
+        ORDER BY f.added_at DESC
+        LIMIT 25`,
+      [interaction.user.id],
+    );
+    if (!rows) {
+      return interaction.editReply('⚠️ Stats are temporarily unavailable — try again shortly.');
+    }
+    if (rows.length === 0) {
+      return interaction.editReply("You haven't favourited anything yet — hit ⭐ on a now-playing message.");
+    }
+
+    const lines = rows.map((r, i) => `**${i + 1}.** ${r.artist} — ${r.title}`);
+    await interaction.editReply(
+      `**⭐ Your favourites**\n${lines.join('\n')}\n-# Showing the ${rows.length} most recent.`
+    );
+  }
+
+  // ── /toptracks ─────────────────────────────────────────────────────────
+  if (commandName === 'toptracks') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Ratings are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply();
+    const rows = await db.query(
+      // Aggregated in a derived table so `likes`/`dislikes` are real columns
+      // outside it. MariaDB rejects an alias standing for a group function in
+      // HAVING or ORDER BY ("reference to group function"), unlike MySQL.
+      `SELECT * FROM (
+         SELECT t.artist, t.title,
+                SUM(CASE WHEN r.value =  1 THEN 1 ELSE 0 END) AS likes,
+                SUM(CASE WHEN r.value = -1 THEN 1 ELSE 0 END) AS dislikes
+           FROM ratings r
+           JOIN tracks t ON t.song_id = r.song_id
+          GROUP BY r.song_id, t.artist, t.title
+       ) rated
+        WHERE rated.likes > 0
+        ORDER BY (rated.likes - rated.dislikes) DESC, rated.likes DESC
+        LIMIT 10`,
+    );
+    if (!rows) {
+      return interaction.editReply('⚠️ Stats are temporarily unavailable — try again shortly.');
+    }
+    if (rows.length === 0) {
+      // Deliberately not "nothing has been rated" — dislikes and favourites
+      // don't appear here, so that reads as a bug when they exist.
+      return interaction.editReply('No tracks have been liked yet — hit 👍 on a now-playing message.');
+    }
+
+    const medals = ['🥇', '🥈', '🥉'];
+    const lines = rows.map((r, i) => {
+      const dislikes = Number(r.dislikes) > 0 ? ` 👎 ${r.dislikes}` : '';
+      return `${medals[i] ?? `**${i + 1}.**`} ${r.artist} — ${r.title}  👍 ${r.likes}${dislikes}`;
+    });
+    await interaction.editReply(`**🎶 Top rated tracks**\n${lines.join('\n')}`);
+  }
+
+  // ── /listentime ────────────────────────────────────────────────────────
+  if (commandName === 'listentime') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Listener stats are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+
+    const target = interaction.options.getUser('user') ?? interaction.user;
+    await interaction.deferReply();
+    const rows = await db.query(
+      `SELECT COALESCE(${LISTENED_SECONDS}, 0) AS total FROM sessions WHERE discord_id = ?`,
+      [target.id],
+    );
+    if (!rows) {
+      return interaction.editReply('⚠️ Stats are temporarily unavailable — try again shortly.');
+    }
+
+    const total = Number(rows[0]?.total ?? 0);
+    const who = target.id === interaction.user.id ? "You've" : `**${target.username}** has`;
+    if (total === 0) {
+      return interaction.editReply(`${who} not listened to Ephemeral FM yet.`);
+    }
+    await interaction.editReply(`🎧 ${who} listened to Ephemeral FM for **${formatDuration(total)}**.`);
+  }
+
+  // ── /toplisteners ──────────────────────────────────────────────────────
+  if (commandName === 'toplisteners') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Listener stats are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply();
+    const rows = await db.query(
+      `SELECT s.discord_id, COALESCE(${LISTENED_SECONDS}, 0) AS total
+         FROM sessions s
+         LEFT JOIN users u ON u.discord_id = s.discord_id
+        WHERE COALESCE(u.opted_out, 0) = 0
+        GROUP BY s.discord_id
+        ORDER BY total DESC
+        LIMIT 10`,
+    );
+    if (!rows) {
+      return interaction.editReply('⚠️ Stats are temporarily unavailable — try again shortly.');
+    }
+    if (rows.length === 0) {
+      return interaction.editReply('No listening time recorded yet.');
+    }
+
+    const medals = ['🥇', '🥈', '🥉'];
+    const lines = rows.map((row, i) =>
+      `${medals[i] ?? `**${i + 1}.**`} <@${row.discord_id}> — ${formatDuration(Number(row.total))}`
+    );
+    await interaction.editReply({
+      content: `**🎧 Top listeners**\n${lines.join('\n')}\n-# Opt out any time with \`/optout\`.`,
+      allowedMentions: { parse: [] }, // render the names without pinging ten people
+    });
+  }
+
+  // ── /optout ────────────────────────────────────────────────────────────
+  if (commandName === 'optout') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Listener stats are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+
+    const userId = interaction.user.id;
+    const nowOptedOut = !optedOut.has(userId);
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const result = await db.query(
+      `INSERT INTO users (discord_id, first_seen, last_seen, opted_out)
+       VALUES (?, NOW(3), NOW(3), ?)
+       ON DUPLICATE KEY UPDATE opted_out = VALUES(opted_out), last_seen = NOW(3)`,
+      [userId, nowOptedOut ? 1 : 0],
+    );
+    if (!result) {
+      return interaction.editReply('⚠️ Stats are temporarily unavailable — try again shortly.');
+    }
+
+    if (nowOptedOut) {
+      optedOut.add(userId);
+      await reconcileSessions(); // ends any session already running for them
+      log.info(`${interaction.user.tag} opted out of listener stats.`);
+      await interaction.editReply(
+        '🚫 **Opted out** — your listening time and ratings are no longer recorded, and you are hidden from `/toplisteners`.\n' +
+        '-# Existing data is kept. Use `/forgetme` to delete it, or `/optout` again to resume.'
+      );
+    } else {
+      optedOut.delete(userId);
+      await reconcileSessions(); // starts one if they're listening right now
+      log.info(`${interaction.user.tag} opted back in to listener stats.`);
+      await interaction.editReply('✅ **Opted back in** — your listening time is being recorded again.');
+    }
+  }
+
+  // ── /forgetme ──────────────────────────────────────────────────────────
+  if (commandName === 'forgetme') {
+    if (!db.enabled) {
+      return interaction.reply({ content: 'Listener stats are not enabled on this bot.', flags: MessageFlags.Ephemeral });
+    }
+
+    const userId = interaction.user.id;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    // Drop any in-flight session first, or the reconcile loop would immediately
+    // write a fresh row for a user who just asked to be forgotten.
+    for (const key of [...openSessions.keys()]) {
+      if (openSessions.get(key)?.discordId === userId) openSessions.delete(key);
+    }
+
+    // Sessions last: if an earlier delete fails we bail with the user row still
+    // present, so a retry is a clean re-run rather than a half-erased account.
+    const ratings = await db.query('DELETE FROM ratings WHERE discord_id = ?', [userId]);
+    const favourites = await db.query('DELETE FROM favourites WHERE discord_id = ?', [userId]);
+    const deleted = await db.query('DELETE FROM sessions WHERE discord_id = ?', [userId]);
+    const user = await db.query('DELETE FROM users WHERE discord_id = ?', [userId]);
+    if (!ratings || !favourites || !deleted || !user) {
+      return interaction.editReply('⚠️ Stats are temporarily unavailable — deletion may be incomplete. Run `/forgetme` again shortly.');
+    }
+
+    optedOut.delete(userId);
+    log.info(`${interaction.user.tag} deleted their data (${deleted.affectedRows} sessions, ${ratings.affectedRows} ratings, ${favourites.affectedRows} favourites).`);
+    await interaction.editReply(
+      `🗑️ **Deleted** — ${deleted.affectedRows} listening session(s), ${ratings.affectedRows} rating(s) and ${favourites.affectedRows} favourite(s) removed. Nothing about you is stored now.\n` +
+      '-# Recording starts again next time you listen. Use `/optout` first if you would rather it did not.'
+    );
   }
 
   // ── /help ──────────────────────────────────────────────────────────────
@@ -1197,6 +1802,17 @@ client.on('interactionCreate', async (interaction) => {
       '`/play` — join your voice channel and start streaming',
       '`/stop` — stop streaming and leave the channel',
       '`/nowplaying` — show the current track and listener count',
+      '',
+      '**Rating tracks**',
+      '👍 👎 ⭐ buttons appear on now-playing messages — or use `/like`, `/dislike`, `/favourite`',
+      '`/favourites` — the tracks you starred *(works in DMs too)*',
+      '`/toptracks` — the highest rated tracks on the station',
+      '',
+      '**Stats**',
+      '`/listentime` — how long you (or someone else) have listened',
+      '`/toplisteners` — the longest-listening users',
+      '`/optout` — stop recording your listening time *(works in DMs too)*',
+      '`/forgetme` — delete everything stored about you *(works in DMs too)*',
       '',
       '**Alerts**',
       '`/subscribe` — DM you whenever a DJ goes live *(works in DMs too)*',
@@ -1231,7 +1847,7 @@ client.on('interactionCreate', async (interaction) => {
         .setEmoji('🎧'),
     );
 
-    await interaction.reply({ content: lines.join('\n'), components: [row], ephemeral: true });
+    await interaction.reply({ content: lines.join('\n'), components: [row], flags: MessageFlags.Ephemeral });
   }
 
   // ── /subscribe ─────────────────────────────────────────────────────────
@@ -1244,7 +1860,7 @@ client.on('interactionCreate', async (interaction) => {
       log.info(`${interaction.user.tag} unsubscribed from live DM alerts (${subscribers.size} total).`);
       return interaction.reply({
         content: '🔕 **Unsubscribed** — you will no longer get DMs when a DJ goes live.\n-# Changed your mind? Just run `/subscribe` again.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -1276,14 +1892,14 @@ client.on('interactionCreate', async (interaction) => {
     } catch {
       return interaction.reply({
         content: "❌ I couldn't DM you. Enable **Direct Messages** for this server (Server Settings → Privacy Settings) and try again.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     subscribers.add(userId);
     saveSubscribers();
     log.info(`${interaction.user.tag} subscribed to live DM alerts (${subscribers.size} total).`);
-    await interaction.reply({ content: '🔔 Subscribed! Check your DMs — I just sent a confirmation.', ephemeral: true });
+    await interaction.reply({ content: '🔔 Subscribed! Check your DMs — I just sent a confirmation.', flags: MessageFlags.Ephemeral });
   }
 });
 
@@ -1307,6 +1923,9 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       persistGuildConfig(guildId, { voiceChannelId: newState.channelId });
       log.info(`[${newState.guild?.name ?? guildId}] Moved ${from ? `from ${from} ` : ''}to ${newState.channelId} — following.`);
       ensureStream(); // start if the new channel has listeners; no-op if already playing
+      // The listener set changed wholesale: everyone left behind stops counting,
+      // everyone in the destination starts.
+      reconcileSessions();
     }
     // channelId === null means fully disconnected — the connection's own
     // Disconnected/error handlers own that recovery path, so nothing to do here.
@@ -1319,6 +1938,9 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   if (oldState.channelId !== state.voiceChannelId && newState.channelId !== state.voiceChannelId) return;
 
   ensureStream();
+  // Catches joins, leaves, and deafen/undeafen — a user who deafens without
+  // moving fires this too, and should stop accruing listening time.
+  reconcileSessions();
 });
 
 client.login(process.env.BOT_TOKEN);
