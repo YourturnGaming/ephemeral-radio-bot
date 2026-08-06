@@ -14,7 +14,8 @@ A Discord bot that streams [Ephemeral FM](https://ephemeral.club) into your voic
 - 💾 Remembers your settings (announce channel, ping role, voice channel, subscribers) across restarts
 - 🪶 Single shared stream — one connection to the radio source no matter how many servers it streams to
 - 💤 Only streams when someone's listening — stays parked in the channel 24/7 but goes silent (and drops the radio connection) when the channel is empty
-- `/play` `/stop` `/nowplaying` `/announce` `/songs` `/setrole` `/subscribe` `/help` slash commands
+- 🚚 `/move` — admins can send the bot to another voice channel, or call it to theirs, without interrupting playback
+- `/play` `/stop` `/move` `/nowplaying` `/announce` `/songs` `/setrole` `/subscribe` `/help` slash commands
 
 ---
 
@@ -130,6 +131,7 @@ By default Pelican will show the server as **Starting** forever because the egg 
 |---|---|---|
 | `/play` | Server | Join your voice channel and start streaming. Shows current track and listener count. |
 | `/stop` | Server | Stop streaming and leave the voice channel |
+| `/move` | Server | Move the bot to another voice channel. Leave the `channel` option blank to bring it to yours. Requires **Move Members** (or **Manage Server**) and the bot to be streaming. |
 | `/nowplaying` | Server | Show the currently playing track and listener count |
 | `/announce` | Server | Toggle live DJ announcements in the current channel (goes live / set ends). Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
 | `/songs` | Server | Toggle song change announcements in the current channel. No role ping. Run again to turn off, or run in a different channel to move it there. Requires the bot to be streaming. |
@@ -154,7 +156,8 @@ Notes:
 - Subscriptions are **per user, not per server** — you get one DM per live set even if you share several servers with the bot
 - If your DMs are closed, `/subscribe` tells you instead of silently failing, and users who later close their DMs are pruned from the list automatically
 - Run `/subscribe` again (or hit the button) any time to stop
-- Alerts fire when a set **starts**. Channel announcements via `/announce` also cover set endings.
+- Alerts fire when a set **starts** and again when it **ends**, so you're never left with a "now live" DM for a set that finished hours ago
+- Live state survives restarts. Restarting the bot mid-set won't re-announce it, and if a set ended while the bot was down, the end alert goes out on the next poll instead of being lost
 
 ---
 
@@ -164,11 +167,12 @@ The bot saves its settings to the `data/` directory and restores them automatica
 
 | Setting | Stored in | Set by | Cleared by |
 |---|---|---|---|
-| Voice channel to stream in | `guilds.json` | `/play` | `/stop` |
+| Voice channel to stream in | `guilds.json` | `/play`, `/move` | `/stop` |
 | Live DJ announcement channel | `guilds.json` | `/announce` | `/announce` (toggle off) |
 | Song announcement channel | `guilds.json` | `/songs` | `/songs` (toggle off) |
 | Ping role (live DJ only) | `guilds.json` | `/setrole @role` | `/setrole` (no role selected) |
 | DM alert subscribers | `subscribers.json` | `/subscribe` | `/subscribe` (toggle off) |
+| Live DJ state (who's on air) | `live.json` | the metadata poll | the metadata poll |
 
 The bot will **automatically rejoin** its voice channel after a restart — no need to run `/play` again.
 
@@ -179,7 +183,7 @@ The bot will **automatically rejoin** its voice channel after a restart — no n
 - **One shared stream.** No matter how many servers the bot streams to, it opens a single connection to the radio source and fans that one audio feed out to every voice channel. So on the website's listener count the bot only ever shows as **1** listener while playing (plus 1 for the always-on title watcher), not one per server.
 - **Listener-aware.** The bot stays parked in its voice channel 24/7, but it only runs the stream while a real (non-bot) user is in the channel with it. When everyone leaves, it goes silent and drops the radio connection; when someone joins, it starts back up automatically.
 - **Outage-aware.** If the radio source becomes unreachable (e.g. your internet drops), the bot detects it via the metadata API and *stops* trying to reconnect the audio stream — instead of hammering the server with a new connection every couple of seconds. It reconnects automatically, with exponential backoff, once connectivity returns. This prevents the listener count from being inflated by stale/half-open connections during an outage.
-- **Follows moves.** Admins can drag the bot between voice channels without interrupting playback — it adopts the new channel and keeps streaming.
+- **Follows moves.** Admins can drag the bot between voice channels without interrupting playback — it adopts the new channel and keeps streaming. `/move` does the same thing by command, for when dragging isn't practical (mobile, or a channel you can't see). Either way the connection is reused rather than rebuilt, so the audio doesn't cut.
 - **Voice recovery.** When connectivity returns, the bot rebuilds its Discord voice connections. A network drop can leave a voice connection as a stale "zombie" (still marked ready, but audio goes nowhere) without ever firing a disconnect event, so the bot proactively re-establishes them rather than waiting for an event that never comes.
 
 ---

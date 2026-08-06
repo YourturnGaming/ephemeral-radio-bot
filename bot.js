@@ -9,6 +9,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   InteractionContextType,
 } = require('discord.js');
 const {
@@ -187,8 +188,42 @@ let globalPlayer = null;
 
 // ── Live DJ detection ──────────────────────────────────────────────────────
 
-let isLive        = false;
-let liveStreamer   = '';
+// Live state is persisted so a restart doesn't read as a fresh set. Without it
+// isLive resets to false on boot, the first poll sees `is_live && !isLive`, and
+// every subscriber gets DMed about a set they were already told about. Restoring
+// it also means that if the set ended while we were down, the first poll hits
+// the `!is_live && isLive` branch instead and sends the end alert that was missed.
+
+const LIVE_FILE = path.join(DATA_DIR, 'live.json');
+
+function loadLiveState() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(LIVE_FILE, 'utf8'));
+    const state = { isLive: !!saved.isLive, liveStreamer: saved.liveStreamer ?? '' };
+    if (state.isLive) {
+      log.info(`Restored live state: ${state.liveStreamer || 'unknown DJ'} was live at shutdown (last saved ${saved.updatedAt ?? 'unknown'}).`);
+    }
+    return state;
+  } catch {
+    return { isLive: false, liveStreamer: '' };
+  }
+}
+
+function saveLiveState() {
+  try {
+    fs.writeFileSync(
+      LIVE_FILE,
+      JSON.stringify({ isLive, liveStreamer, updatedAt: new Date().toISOString() }, null, 2),
+    );
+  } catch (err) {
+    log.error(`Failed to save live state: ${err.message}`);
+  }
+}
+
+const savedLive = loadLiveState();
+
+let isLive        = savedLive.isLive;
+let liveStreamer  = savedLive.liveStreamer;
 let listenerCount = 0;
 
 function updateStatus() {
@@ -222,29 +257,23 @@ function announce(message) {
   }
 }
 
-// DMs every subscriber that a DJ has gone live, with a link button to the site
-// (Discord re-encodes voice audio, so the direct stream sounds noticeably better).
-// Sent sequentially with a small gap to stay clear of Discord's DM rate limits;
-// users who have DMs closed (error 50007) are dropped so we stop retrying them.
-async function notifyLive(streamerName) {
-  if (subscribers.size === 0) return;
+// Every subscriber DM carries a link to the site (Discord re-encodes voice audio,
+// so the direct stream sounds noticeably better).
+function listenButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel('Listen at ephemeral.club')
+      .setStyle(ButtonStyle.Link)
+      .setURL(SITE_URL)
+      .setEmoji('🎧'),
+  );
+}
 
-  const payload = {
-    content:
-      `🎙️ **${streamerName}** is now live on Ephemeral FM!\n\n` +
-      `🎧 Listening in Discord works, but Discord compresses the audio — ` +
-      `open the site below for full-quality sound.\n\n` +
-      '-# To stop these alerts, run `/subscribe` again — in any server we share, or right here in this DM.',
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setLabel('Listen at ephemeral.club')
-          .setStyle(ButtonStyle.Link)
-          .setURL(SITE_URL)
-          .setEmoji('🎧'),
-      ),
-    ],
-  };
+// Sends one payload to every subscriber, sequentially with a small gap to stay
+// clear of Discord's DM rate limits. Users who have DMs closed (error 50007) are
+// dropped from the list so we stop retrying them on every future alert.
+async function dmSubscribers(payload, label) {
+  if (subscribers.size === 0) return;
 
   const total = subscribers.size;
   let sent = 0;
@@ -266,7 +295,43 @@ async function notifyLive(streamerName) {
   }
 
   if (pruned) saveSubscribers();
-  log.info(`Live DM alerts sent to ${sent}/${total} subscribers${pruned ? ` (${pruned} pruned: DMs closed)` : ''}.`);
+  log.info(`${label} DMs sent to ${sent}/${total} subscribers${pruned ? ` (${pruned} pruned: DMs closed)` : ''}.`);
+}
+
+// DM runs are queued, never run concurrently. A run takes ~250ms per subscriber,
+// so with a decent subscriber list a short set can end while the "went live" run
+// is still in flight — without serialising, the "set ended" DMs would interleave
+// with, or even overtake, the ones announcing it started.
+let dmQueue = Promise.resolve();
+
+function queueDmRun(fn) {
+  dmQueue = dmQueue
+    .then(fn)
+    .catch((err) => log.warn(`Subscriber DM run failed: ${err.message}`));
+}
+
+// DMs every subscriber that a DJ has gone live.
+function notifyLive(streamerName) {
+  queueDmRun(() => dmSubscribers({
+    content:
+      `🎙️ **${streamerName}** is now live on Ephemeral FM!\n\n` +
+      `🎧 Listening in Discord works, but Discord compresses the audio — ` +
+      `open the site below for full-quality sound.\n\n` +
+      '-# To stop these alerts, run `/subscribe` again — in any server we share, or right here in this DM.',
+    components: [listenButtonRow()],
+  }, 'Live start'));
+}
+
+// ...and that the set has wrapped up. Subscribers only ever heard the start
+// before, so a DJ going offline left the last DM in their inbox reading as if
+// the set were still running.
+function notifyLiveEnded(streamerName) {
+  queueDmRun(() => dmSubscribers({
+    content:
+      `📻 **${streamerName}**'s set has ended — Ephemeral FM is back to regular programming.\n\n` +
+      '-# To stop these alerts, run `/subscribe` again — in any server we share, or right here in this DM.',
+    components: [listenButtonRow()],
+  }, 'Live end'));
 }
 
 // Song change announcements — no role ping
@@ -300,22 +365,36 @@ async function pollLiveStatus() {
     if (is_live && !isLive) {
       isLive = true;
       liveStreamer = streamer_name;
+      saveLiveState();
       log.info(`Live DJ started: ${streamer_name} (${listenerCount} listeners)`);
       updateStatus();
       announce(
         `🎙️ **${streamer_name}** is now live on Ephemeral FM!\n` +
         `🎧 For the best audio quality, listen direct at ${SITE_URL} — Discord compresses the stream.`
       );
-      // Fire-and-forget: DMs are throttled and can take a while with many
+      // Queued, not awaited: DMs are throttled and can take a while with many
       // subscribers, so don't hold up the poll loop waiting on them.
-      notifyLive(streamer_name)
-        .catch((err) => log.warn(`Subscriber DM run failed: ${err.message}`));
+      notifyLive(streamer_name);
     } else if (!is_live && isLive) {
+      // Captured before we clear it below. Falls back in case the API reported a
+      // live set with no streamer_name — better than DMing everyone about "null".
+      const endedStreamer = liveStreamer || 'The DJ';
       isLive = false;
       liveStreamer = '';
-      log.info('Live DJ ended, reverting to track metadata.');
+      saveLiveState();
+      log.info(`Live DJ ended (${endedStreamer}), reverting to track metadata.`);
       updateStatus();
       announce(`📻 Live set ended — back to regular programming.`);
+      notifyLiveEnded(endedStreamer);
+    } else if (is_live && streamer_name && streamer_name !== liveStreamer) {
+      // Still live, but a different DJ than we recorded — a back-to-back handover
+      // with no gap, or a set that changed hands while the bot was down. Neither
+      // transition branch fires here, so without this the status and the next end
+      // alert would keep naming the previous DJ.
+      log.info(`Live DJ changed: ${liveStreamer || 'unknown'} → ${streamer_name}`);
+      liveStreamer = streamer_name;
+      saveLiveState();
+      updateStatus();
     } else {
       // Listener count may have changed even if live state didn't — refresh status
       updateStatus();
@@ -597,7 +676,7 @@ globalPlayer.on('error', (err) => {
 
 // Builds a fresh voice connection for a guild, subscribes it to the shared
 // player, and waits until it's actually Ready. Throws if it never reaches Ready.
-async function joinAndSubscribe(guildId, guild) {
+async function joinAndSubscribe(guildId, guild, forceChannelId = null) {
   const state = guildState.get(guildId);
   const g = guild ?? client.guilds.cache.get(guildId);
 
@@ -605,9 +684,11 @@ async function joinAndSubscribe(guildId, guild) {
   // just dragged the bot, a Disconnected event can fire before the
   // voiceStateUpdate handler adopts the new channel — using the live value stops
   // us rejoining the old channel and yanking the bot back. Falls back to the
-  // stored channel when the bot isn't in one (e.g. it was kicked).
+  // stored channel when the bot isn't in one (e.g. it was kicked). An explicit
+  // /move passes forceChannelId, which outranks both — the whole point of that
+  // command is to go somewhere the bot currently isn't.
   const liveChannelId = g?.members?.me?.voice?.channelId;
-  const channelId = liveChannelId ?? state.voiceChannelId;
+  const channelId = forceChannelId ?? liveChannelId ?? state.voiceChannelId;
   if (channelId !== state.voiceChannelId) {
     state.voiceChannelId = channelId;
     persistGuildConfig(guildId, { voiceChannelId: channelId });
@@ -625,6 +706,39 @@ async function joinAndSubscribe(guildId, guild) {
   // joinVoiceChannel() is synchronous — wait for real readiness so we never
   // declare success while the network is still down.
   await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+}
+
+// Moves the bot's voice connection to another channel in the same guild.
+// Uses connection.rejoin() rather than joinVoiceChannel(): the latter hands back
+// the SAME connection object for a guild that already has one, so we'd stack a
+// second set of disconnect handlers on it and end up with duplicate rejoin loops.
+async function moveToChannel(guildId, guild, channelId) {
+  const state = guildState.get(guildId);
+
+  // A rejoin loop may be mid-backoff (e.g. the bot was kicked moments ago). We're
+  // about to establish the connection ourselves, so cancel it — otherwise it
+  // fires later and drags the bot back to the channel it was aiming for.
+  if (state.rejoinTimer) { clearTimeout(state.rejoinTimer); state.rejoinTimer = null; }
+  state.rejoining = false;
+  state.rejoinAttempts = 0;
+
+  state.voiceChannelId = channelId;
+  persistGuildConfig(guildId, { voiceChannelId: channelId });
+
+  const connection = state.connection;
+  if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
+    // rejoin() returns false when the voice adapter couldn't send the state
+    // update — fail fast instead of sitting out the full 15s entersState timeout.
+    if (!connection.rejoin({ channelId, selfDeaf: false, selfMute: false })) {
+      throw new Error('voice adapter unavailable');
+    }
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+  } else {
+    // No usable connection (kicked, or a recovery that gave up) — build a fresh one.
+    await joinAndSubscribe(guildId, guild, channelId);
+  }
+
+  ensureStream(); // start if the new channel has listeners, go quiet if it's empty
 }
 
 // Entry point for recovering a lost voice connection. Guarded by state.rejoining
@@ -754,6 +868,20 @@ const commands = [
     .setName('stop')
     .setDescription('Stop the stream and leave the voice channel')
     .setContexts(GUILD_ONLY),
+  // Locked down two ways: setDefaultMemberPermissions hides it from members
+  // without Move Members (server owners can re-grant it per-role in Integrations
+  // settings), and the handler re-checks at runtime as a backstop.
+  new SlashCommandBuilder()
+    .setName('move')
+    .setDescription('Move the bot to another voice channel — defaults to yours (Move Members required)')
+    .addChannelOption((opt) =>
+      opt.setName('channel')
+        .setDescription('Voice channel to move to — leave blank to bring the bot to you')
+        .addChannelTypes(ChannelType.GuildVoice)
+        .setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.MoveMembers)
+    .setContexts(GUILD_ONLY),
   new SlashCommandBuilder()
     .setName('nowplaying')
     .setDescription('Show what is currently playing on Ephemeral FM')
@@ -800,15 +928,17 @@ client.once('clientReady', async () => {
   }
 
   watchIcyMetadata();
-  pollLiveStatus();
 
-  // Auto-rejoin any voice channels the bot was in before restart
-  for (const [guildId, cfg] of Object.entries(guildConfig)) {
-    if (!cfg.voiceChannelId) continue;
+  // Auto-rejoin any voice channels the bot was in before restart. Run in
+  // parallel: sequentially, one unreachable guild burns its full 15s entersState
+  // timeout before the next even starts, and the live poll below waits on all of
+  // it. In parallel the whole loop is bounded by the slowest single guild.
+  await Promise.all(Object.entries(guildConfig).map(async ([guildId, cfg]) => {
+    if (!cfg.voiceChannelId) return;
     try {
       const guild = await client.guilds.fetch(guildId);
       const channel = await guild.channels.fetch(cfg.voiceChannelId);
-      if (!channel?.isVoiceBased()) continue;
+      if (!channel?.isVoiceBased()) return;
 
       const connection = joinVoiceChannel({
         channelId: channel.id,
@@ -835,7 +965,14 @@ client.once('clientReady', async () => {
     } catch (err) {
       log.warn(`[${guildId}] Auto-rejoin failed: ${err.message}`);
     }
-  }
+  }));
+
+  // Started only after the rejoins settle. The first poll can fire a live-state
+  // transition (a set that ended while the bot was down), and announce() reads
+  // guildState — which the loop above is what populates. Polling first meant that
+  // announcement went to an empty map and was silently dropped, while the DM for
+  // the same event still went out.
+  pollLiveStatus();
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -936,6 +1073,55 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.reply('Stopped streaming and left the voice channel.');
   }
 
+  // ── /move ──────────────────────────────────────────────────────────────
+  if (commandName === 'move') {
+    // Move Members is the Discord-native permission for dragging someone between
+    // voice channels; Manage Server is accepted too so the people who already
+    // configure the bot via /setrole can move it without a second role grant.
+    const canMove = interaction.memberPermissions?.has(PermissionFlagsBits.MoveMembers)
+      || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+    if (!canMove) {
+      return interaction.reply({ content: 'You need the **Move Members** or **Manage Server** permission to use this command.', ephemeral: true });
+    }
+
+    const state = guildState.get(guildId);
+    if (!state) {
+      return interaction.reply({ content: 'The bot is not currently streaming. Use `/play` first.', ephemeral: true });
+    }
+
+    // No channel given → "follow me": bring the bot to the caller's channel.
+    const target = interaction.options.getChannel('channel') ?? member?.voice?.channel;
+    if (!target) {
+      return interaction.reply({ content: 'Join a voice channel first, or pick one with the `channel` option.', ephemeral: true });
+    }
+    // Stage channels join as a suppressed audience member, so the bot would sit
+    // there streaming to nobody — reject them rather than fail silently.
+    if (target.type !== ChannelType.GuildVoice) {
+      return interaction.reply({ content: 'That is not a regular voice channel — stage channels are not supported.', ephemeral: true });
+    }
+    if (target.id === state.voiceChannelId) {
+      return interaction.reply({ content: `Already streaming in **${target.name}**.`, ephemeral: true });
+    }
+
+    // Checked up front so a missing permission reads as a clear message instead
+    // of a connection that silently never reaches Ready.
+    const perms = guild?.members?.me ? target.permissionsFor(guild.members.me) : null;
+    if (!perms?.has(PermissionFlagsBits.Connect) || !perms.has(PermissionFlagsBits.Speak)) {
+      return interaction.reply({ content: `I need **Connect** and **Speak** in **${target.name}** to stream there.`, ephemeral: true });
+    }
+
+    await interaction.deferReply();
+    try {
+      await moveToChannel(guildId, guild, target.id);
+      log.info(`[${guild?.name ?? guildId}] Moved to #${target.name} by ${interaction.user.tag}`);
+      await interaction.editReply(`📻 Moved to **${target.name}**.`);
+    } catch (err) {
+      log.warn(`[${guildId}] Move to #${target.name} failed: ${err.message}`);
+      scheduleRejoin(guildId, guild); // hand recovery back to the normal backoff loop
+      await interaction.editReply(`❌ Couldn't reach **${target.name}** (${err.message}) — retrying in the background.`);
+    }
+  }
+
   // ── /nowplaying ────────────────────────────────────────────────────────
   if (commandName === 'nowplaying') {
     const trackLine = isLive
@@ -1017,8 +1203,9 @@ client.on('interactionCreate', async (interaction) => {
       '`/announce` — post live DJ alerts in this channel',
       '`/songs` — post every song change in this channel',
       '',
-      '**Admin** *(requires Manage Server)*',
-      '`/setrole` — pick a role to ping on live DJ alerts. Leave the option blank to clear it.',
+      '**Admin**',
+      '`/move` — bring the bot to your voice channel, or pass one to send it there *(Move Members)*',
+      '`/setrole` — pick a role to ping on live DJ alerts. Leave the option blank to clear it. *(Manage Server)*',
       '',
       '-# 🎧 Discord compresses audio — listen at ephemeral.club for full quality.',
     ];
